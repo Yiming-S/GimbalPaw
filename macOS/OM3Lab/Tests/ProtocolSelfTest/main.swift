@@ -134,12 +134,12 @@ do {
         confidence: 0.9
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .fast)?.yawTenths == 15,
-        "continuous fast tracking must keep a small near-center step"
+        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .fast)?.yawTenths == 21,
+        "continuous fast tracking must ramp gently near the dead zone"
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .fast)?.yawTenths == 35,
-        "continuous fast tracking must use a progressive medium step"
+        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .fast)?.yawTenths == 50,
+        "continuous fast tracking must interpolate the medium band"
     )
     let previousContinuousMaximumRate = 45.0 / 0.21
     let upgradedMaximumRate = Double(PersonTrackingSpeedMode.fast.yawMaximumTenths)
@@ -374,20 +374,48 @@ do {
         identityMissing.candidates.first?.id == identityRightID,
         "unlocked bystander identity must remain stable"
     )
-    let identityNearbyAfterMiss = identityTracker.update(
+    let identityAfterFlicker = identityTracker.update(
         detections: [identityReordered.candidates[1].detection, identityLeft],
         sequence: 4,
         observedAtUptime: 20.24
     )
     expect(
-        identityNearbyAfterMiss.lockedDetection == nil,
-        "a rectangle near a missing target must not inherit the lock"
+        identityAfterFlicker.lockedCandidate?.id == identityLeftID,
+        "the same geometry must resolve the lock again within the flicker tolerance"
     )
     expect(
-        !identityNearbyAfterMiss.candidates.map(\.id).contains(identityLeftID),
-        "a missing locked ID must stay unresolved until explicit reselection"
+        !identityTracker.hasUnresolvedRetiredLock,
+        "a lock resolved after a flicker must not be reported as retired"
     )
-    let replacementLeft = identityNearbyAfterMiss.candidates.first {
+
+    var identitySequence: UInt64 = 5
+    for step in 1...5 {
+        _ = identityTracker.update(
+            detections: [identityReordered.candidates[1].detection],
+            sequence: identitySequence,
+            observedAtUptime: 20.24 + Double(step) * 0.08
+        )
+        identitySequence += 1
+    }
+    expect(
+        identityTracker.hasUnresolvedRetiredLock,
+        "a target missing beyond the flicker tolerance must retire its lock"
+    )
+    let identityNearbyAfterRetirement = identityTracker.update(
+        detections: [identityReordered.candidates[1].detection, identityLeft],
+        sequence: identitySequence,
+        observedAtUptime: 20.72
+    )
+    identitySequence += 1
+    expect(
+        identityNearbyAfterRetirement.lockedDetection == nil,
+        "a rectangle near a retired target must not inherit the lock"
+    )
+    expect(
+        !identityNearbyAfterRetirement.candidates.map(\.id).contains(identityLeftID),
+        "a retired locked ID must stay unresolved until an explicit transfer"
+    )
+    let replacementLeft = identityNearbyAfterRetirement.candidates.first {
         abs($0.detection.centerX - identityLeft.centerX) < 0.001
     }
     expect(replacementLeft != nil, "returned target must be exposed as a new candidate")
@@ -405,8 +433,8 @@ do {
                 confidence: identityLeft.confidence
             ),
         ],
-        sequence: 5,
-        observedAtUptime: 20.32
+        sequence: identitySequence,
+        observedAtUptime: 20.80
     )
     expect(
         identityAfterReselection.lockedID == replacementLeft?.id

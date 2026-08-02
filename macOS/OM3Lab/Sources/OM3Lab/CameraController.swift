@@ -149,6 +149,13 @@ private final class CameraCaptureEngine: @unchecked Sendable {
 
     func setPersonTrackingSession(_ lease: PersonVisionSessionLease?) {
         personAnalyzer.setSession(lease)
+        if lease == nil {
+            personAnalyzer.setTrackingSeed(nil)
+        }
+    }
+
+    func setPersonTrackingSeed(_ detection: PersonDetection?) {
+        personAnalyzer.setTrackingSeed(detection)
     }
 
     func setMotionCalibrationSession(_ lease: GimbalMotionSessionLease?) {
@@ -303,6 +310,37 @@ private final class CameraCaptureEngine: @unchecked Sendable {
         return currentInputDeviceID == deviceID
     }
 
+    /// Freezes (or restores) auto exposure and white balance for motion
+    /// calibration, where an AE step alone can defeat the luma comparison.
+    /// Many UVC devices reject these modes; the analysis stays best-effort.
+    func setAutoAdjustmentsLocked(_ locked: Bool) {
+        queue.async { [weak self] in
+            guard let self, let device = self.currentInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                if locked {
+                    if device.isExposureModeSupported(.locked) {
+                        device.exposureMode = .locked
+                    }
+                    if device.isWhiteBalanceModeSupported(.locked) {
+                        device.whiteBalanceMode = .locked
+                    }
+                } else {
+                    if device.isExposureModeSupported(.continuousAutoExposure) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                    if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                        device.whiteBalanceMode = .continuousAutoWhiteBalance
+                    }
+                }
+            } catch {
+                // Unsupported on this device; calibration falls back to the
+                // exposure-delta guard in the analysis itself.
+            }
+        }
+    }
+
     private func emit(_ event: CameraEngineEvent) {
         onEvent?(event)
     }
@@ -328,9 +366,17 @@ final class CameraController: ObservableObject {
     @Published private(set) var devices: [CameraDeviceDescriptor] = []
     @Published private(set) var selectedDeviceID: String?
     @Published private(set) var personTrackingEnabled = false
-    @Published private(set) var personSample: PersonVisionSample?
     @Published private(set) var motionCalibrationEnabled = false
-    @Published private(set) var motionSample: GimbalMotionFrameSample?
+
+    /// Direct main-thread delivery for the ~12.5 Hz vision samples. Publishing
+    /// these through @Published used to invalidate every camera observer's
+    /// whole view tree per frame and added a Combine hop to the freshness-
+    /// budgeted path. Single consumer each: the two coordinators.
+    var onPersonSample: ((PersonVisionSample) -> Void)?
+    var onMotionSample: ((GimbalMotionFrameSample) -> Void)?
+
+    private var lastPersonSampleSequence: UInt64 = 0
+    private var lastMotionSampleSequence: UInt64 = 0
 
     let session: AVCaptureSession
     private let engine: CameraCaptureEngine
@@ -421,8 +467,14 @@ final class CameraController: ObservableObject {
         } else {
             engine.setPersonTrackingSession(nil)
             personVisionSessionLease = nil
-            personSample = nil
         }
+    }
+
+    /// Seeds (or clears) the correlation tracker with the locked target's
+    /// latest detector-confirmed box.
+    func setPersonTrackingSeed(_ detection: PersonDetection?) {
+        guard personTrackingEnabled || detection == nil else { return }
+        engine.setPersonTrackingSeed(detection)
     }
 
     func beginMotionCalibration() -> UUID? {
@@ -433,16 +485,18 @@ final class CameraController: ObservableObject {
         let lease = GimbalMotionSessionLease()
         motionSessionLease = lease
         motionCalibrationEnabled = true
-        motionSample = nil
+        engine.setAutoAdjustmentsLocked(true)
         engine.setMotionCalibrationSession(lease)
         return lease.id
     }
 
     func endMotionCalibration() {
         engine.setMotionCalibrationSession(nil)
+        if motionCalibrationEnabled {
+            engine.setAutoAdjustmentsLocked(false)
+        }
         motionSessionLease = nil
         motionCalibrationEnabled = false
-        motionSample = nil
     }
 
     func isMotionCalibrationSessionValid(_ sessionID: UUID) -> Bool {
@@ -488,20 +542,18 @@ final class CameraController: ObservableObject {
             status = .running(name)
         case let .personSample(sample):
             guard personTrackingEnabled,
-                  isPersonTrackingSessionValid(sample.sessionID)
+                  isPersonTrackingSessionValid(sample.sessionID),
+                  sample.sequence > lastPersonSampleSequence
             else { return }
-            if let current = personSample, sample.sequence <= current.sequence {
-                return
-            }
-            personSample = sample
+            lastPersonSampleSequence = sample.sequence
+            onPersonSample?(sample)
         case let .motionSample(sample):
             guard motionCalibrationEnabled,
-                  isMotionCalibrationSessionValid(sample.sessionID)
+                  isMotionCalibrationSessionValid(sample.sessionID),
+                  sample.sequence > lastMotionSampleSequence
             else { return }
-            if let current = motionSample, sample.sequence <= current.sequence {
-                return
-            }
-            motionSample = sample
+            lastMotionSampleSequence = sample.sequence
+            onMotionSample?(sample)
         case .stopped:
             setPersonTrackingEnabled(false)
             endMotionCalibration()

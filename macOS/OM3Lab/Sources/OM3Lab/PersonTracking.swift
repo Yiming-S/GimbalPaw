@@ -44,6 +44,15 @@ struct PersonDetection: Equatable, Sendable {
     var centerY: Double { y + height / 2 }
 }
 
+/// Which stage produced a vision sample. Detector samples carry the full
+/// candidate set and drive identity, acquisition, and loss handling; tracker
+/// samples are full-frame-rate position updates for the already locked target
+/// and never make identity decisions.
+enum PersonVisionSampleOrigin: Equatable, Sendable {
+    case detector
+    case tracker
+}
+
 struct PersonVisionSample: Equatable, Sendable {
     let sessionID: UUID
     let detection: PersonDetection?
@@ -53,18 +62,21 @@ struct PersonVisionSample: Equatable, Sendable {
     let detections: [PersonDetection]
     let sequence: UInt64
     let observedAtUptime: TimeInterval
+    let origin: PersonVisionSampleOrigin
 
     init(
         sessionID: UUID,
         detection: PersonDetection?,
         sequence: UInt64,
-        observedAtUptime: TimeInterval
+        observedAtUptime: TimeInterval,
+        origin: PersonVisionSampleOrigin = .detector
     ) {
         self.sessionID = sessionID
         self.detection = detection
         detections = detection.map { [$0] } ?? []
         self.sequence = sequence
         self.observedAtUptime = observedAtUptime
+        self.origin = origin
     }
 
     init(
@@ -72,13 +84,15 @@ struct PersonVisionSample: Equatable, Sendable {
         detections: [PersonDetection],
         selectedDetection: PersonDetection? = nil,
         sequence: UInt64,
-        observedAtUptime: TimeInterval
+        observedAtUptime: TimeInterval,
+        origin: PersonVisionSampleOrigin = .detector
     ) {
         self.sessionID = sessionID
         detection = selectedDetection
         self.detections = detections
         self.sequence = sequence
         self.observedAtUptime = observedAtUptime
+        self.origin = origin
     }
 }
 
@@ -132,6 +146,12 @@ enum PersonIdentityAssociationPolicy {
     static let maximumCenterDistance = 0.24
     static let maximumMissingDuration: TimeInterval = 0.80
     static let maximumConsecutiveMisses = 10
+    /// The locked track tolerates only a short detector flicker before its
+    /// geometry retires. Both bounds stay below the coordinator's lost timeout
+    /// so a search episode always starts against a fully retired lock, and a
+    /// long-disappeared target still cannot be inherited near its old position.
+    static let lockedMaximumMissingDuration: TimeInterval = 0.35
+    static let lockedMaximumConsecutiveMisses = 3
 
     static func intersectionOverUnion(
         _ lhs: PersonDetection,
@@ -196,6 +216,15 @@ struct PersonIdentityTracker: Sendable {
         PersonIdentitySnapshot(candidates: visibleCandidates, lockedID: lockedID)
     }
 
+    /// True when an explicit lock exists but its track has retired, so no
+    /// visible candidate can resolve it anymore. Resuming motion then requires
+    /// an explicit lock transfer: a user tap, or the coordinator's
+    /// single-candidate reacquisition.
+    var hasUnresolvedRetiredLock: Bool {
+        guard let lockedID else { return false }
+        return tracks[lockedID] == nil
+    }
+
     @discardableResult
     mutating func update(
         detections: [PersonDetection],
@@ -203,6 +232,9 @@ struct PersonIdentityTracker: Sendable {
         observedAtUptime: TimeInterval
     ) -> PersonIdentitySnapshot {
         expireStaleTracks(at: observedAtUptime)
+        // Enforced before matching as well, so a locked track that is already
+        // beyond the flicker tolerance cannot be claimed across a frame gap.
+        retireLockedTrackIfBeyondFlickerTolerance(at: observedAtUptime)
 
         let validDetections = detections.enumerated().filter {
             Self.isValid($0.element)
@@ -235,13 +267,13 @@ struct PersonIdentityTracker: Sendable {
         for trackID in Array(tracks.keys) where !matchedTrackIDs.contains(trackID) {
             tracks[trackID]?.consecutiveMisses += 1
         }
-        // The lock itself remains as an unresolved user choice, but its old
-        // geometry must never compete with a newly selected replacement track.
-        // Retiring it on the first explicit miss also prevents a bystander from
-        // inheriting the locked ID on a later frame.
-        if let lockedID, (tracks[lockedID]?.consecutiveMisses ?? 0) > 0 {
-            tracks.removeValue(forKey: lockedID)
-        }
+        // The lock itself remains as an unresolved user choice once its track
+        // retires: the old geometry must never compete with a newly selected
+        // replacement track, and a bystander must not inherit the locked ID on
+        // a later frame. Within the short flicker tolerance, however, the same
+        // geometry may re-associate so single-frame Vision misses do not drop
+        // the lock.
+        retireLockedTrackIfBeyondFlickerTolerance(at: observedAtUptime)
 
         let unmatchedDetections = validDetections
             .filter { !matchedDetectionIndices.contains($0.offset) }
@@ -314,6 +346,22 @@ struct PersonIdentityTracker: Sendable {
             nextRawID = 1
         }
         return id
+    }
+
+    private mutating func retireLockedTrackIfBeyondFlickerTolerance(
+        at observedAtUptime: TimeInterval
+    ) {
+        guard let lockedID,
+              let track = tracks[lockedID],
+              track.consecutiveMisses > 0
+        else { return }
+        let missingDuration = max(0, observedAtUptime - track.lastSeenAtUptime)
+        if track.consecutiveMisses
+            > PersonIdentityAssociationPolicy.lockedMaximumConsecutiveMisses
+            || missingDuration
+            > PersonIdentityAssociationPolicy.lockedMaximumMissingDuration {
+            tracks.removeValue(forKey: lockedID)
+        }
     }
 
     private mutating func expireStaleTracks(at observedAtUptime: TimeInterval) {
@@ -725,11 +773,23 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
 enum PersonTrackingPolicy {
     static let horizontalDeadZone = 0.12
     static let verticalDeadZone = 0.15
+    /// The vertical framing target sits slightly above the geometric center so
+    /// a tracked person keeps head-room instead of being pinned to the middle.
+    static let verticalCompositionTarget = 0.42
     static let analysisInterval: TimeInterval = 0.08
     static let acquisitionMinimumDuration: TimeInterval = 0.24
     static let reversalPauseDuration: TimeInterval = 0.18
     static let lostTimeout: TimeInterval = 0.40
     static let minimumStopCooldown: TimeInterval = 0.12
+    /// Tracker samples may drive corrections only while the detector has
+    /// confirmed the locked person this recently. This keeps loss handling and
+    /// search purely detector-driven even if the correlation tracker latches
+    /// onto background content.
+    static let trackerBridgeMaximumGap: TimeInterval = 0.20
+    /// The correlation tracker refuses to start from a seed older than this;
+    /// the detector refreshes the seed on every resolved frame.
+    static let trackerSeedMaximumAge: TimeInterval = 0.50
+    static let trackerMinimumConfidence: Float = 0.30
     static let netYawSafetyLimitTenths = GimbalTrackingEnvelope
         .conservativeDefault.rightYawTenths
     static let netPitchSafetyLimitTenths = GimbalTrackingEnvelope
@@ -824,7 +884,7 @@ enum PersonTrackingPolicy {
         speedMode: PersonTrackingSpeedMode = .fast
     ) -> PersonTrackingCorrection? {
         let horizontalError = detection.centerX - 0.5
-        let verticalError = detection.centerY - 0.5
+        let verticalError = detection.centerY - verticalCompositionTarget
 
         let yaw = signedStep(
             error: horizontalError,
@@ -927,14 +987,25 @@ enum PersonTrackingPolicy {
         let magnitude = abs(error)
         guard magnitude > deadZone else { return 0 }
 
-        let step: Int
+        let small = min(smallTenths, maximumTenths)
+        let medium = min(mediumTenths, maximumTenths)
+        // Piecewise-linear through the tuned waypoints instead of three flat
+        // plateaus: corrections scale continuously with the framing error, so
+        // motion no longer visibly jumps between step sizes or oscillates
+        // when the error hovers around a plateau boundary.
+        let step: Double
         if magnitude >= largeThreshold {
-            step = maximumTenths
+            step = Double(maximumTenths)
         } else if magnitude >= mediumThreshold {
-            step = min(mediumTenths, maximumTenths)
+            let ramp = (magnitude - mediumThreshold)
+                / max(largeThreshold - mediumThreshold, 0.000_001)
+            step = Double(medium) + ramp * Double(maximumTenths - medium)
         } else {
-            step = min(smallTenths, maximumTenths)
+            let ramp = (magnitude - deadZone)
+                / max(mediumThreshold - deadZone, 0.000_001)
+            step = Double(small) + ramp * Double(medium - small)
         }
-        return error < 0 ? -step : step
+        let rounded = max(1, Int(step.rounded()))
+        return error < 0 ? -rounded : rounded
     }
 }

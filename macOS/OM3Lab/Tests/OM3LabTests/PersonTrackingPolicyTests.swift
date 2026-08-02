@@ -128,9 +128,11 @@ final class PersonTrackingPolicyTests: XCTestCase {
     }
 
     func testHorizontalDirectionAndClamp() {
+        // Piecewise-linear profile: error 0.30 interpolates the medium→max
+        // band (0.22...0.34) as 35 + (0.08 / 0.12) * 30 ≈ 55.
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.80, centerY: 0.5)),
-            PersonTrackingCorrection(yawTenths: 35, pitchTenths: 0)
+            PersonTrackingCorrection(yawTenths: 55, pitchTenths: 0)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.05, centerY: 0.5)),
@@ -139,9 +141,11 @@ final class PersonTrackingPolicyTests: XCTestCase {
     }
 
     func testVerticalDirectionMatchesCalibratedOM3Mapping() {
+        // Vertical errors measure against the 0.42 head-room composition
+        // target; centerY 0.20 → error −0.22 in the small→medium band.
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.20)),
-            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20)
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -19)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.90)),
@@ -204,14 +208,14 @@ final class PersonTrackingPolicyTests: XCTestCase {
                 for: detection(centerX: 0.65, centerY: 0.5),
                 speedMode: .fast
             ),
-            PersonTrackingCorrection(yawTenths: 15, pitchTenths: 0)
+            PersonTrackingCorrection(yawTenths: 21, pitchTenths: 0)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(
                 for: detection(centerX: 0.78, centerY: 0.5),
                 speedMode: .fast
             ),
-            PersonTrackingCorrection(yawTenths: 35, pitchTenths: 0)
+            PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0)
         )
 
         for mode in PersonTrackingSpeedMode.allCases {
@@ -517,7 +521,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertEqual(second.candidates.first?.id, firstID)
     }
 
-    func testMissingLockedTargetRequiresExplicitReselection() throws {
+    func testLockedTargetSurvivesBriefDetectionFlicker() throws {
         var tracker = PersonIdentityTracker()
         let first = tracker.update(
             detections: [
@@ -531,24 +535,64 @@ final class PersonTrackingPolicyTests: XCTestCase {
         let otherID = try XCTUnwrap(first.candidates.last?.id)
         XCTAssertTrue(tracker.lock(on: lockedID))
 
-        let missing = tracker.update(
-            detections: [detection(centerX: 0.73, centerY: 0.5)],
-            sequence: 2,
-            observedAtUptime: 40.08
-        )
-        XCTAssertEqual(missing.personCount, 1)
-        XCTAssertEqual(missing.candidates.first?.id, otherID)
-        XCTAssertEqual(missing.lockedID, lockedID)
-        XCTAssertFalse(missing.isLockedTargetVisible)
-        XCTAssertNil(missing.lockedDetection)
+        for (index, uptime) in [40.08, 40.16, 40.24].enumerated() {
+            let missing = tracker.update(
+                detections: [detection(centerX: 0.74, centerY: 0.5)],
+                sequence: UInt64(index + 2),
+                observedAtUptime: uptime
+            )
+            XCTAssertNil(missing.lockedDetection)
+            XCTAssertEqual(missing.candidates.first?.id, otherID)
+            XCTAssertFalse(tracker.hasUnresolvedRetiredLock)
+        }
 
         let returned = tracker.update(
             detections: [
-                detection(centerX: 0.72, centerY: 0.5),
+                detection(centerX: 0.73, centerY: 0.5),
+                detection(centerX: 0.33, centerY: 0.5),
+            ],
+            sequence: 5,
+            observedAtUptime: 40.32
+        )
+        XCTAssertEqual(returned.lockedCandidate?.id, lockedID)
+        XCTAssertEqual(
+            try XCTUnwrap(returned.lockedDetection).centerX,
+            0.33,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testLockedTargetRetiresAfterFlickerToleranceAndRequiresExplicitTransfer() throws {
+        var tracker = PersonIdentityTracker()
+        let first = tracker.update(
+            detections: [
+                detection(centerX: 0.30, centerY: 0.5),
+                detection(centerX: 0.75, centerY: 0.5),
+            ],
+            sequence: 1,
+            observedAtUptime: 40
+        )
+        let lockedID = try XCTUnwrap(first.candidates.first?.id)
+        XCTAssertTrue(tracker.lock(on: lockedID))
+
+        var sequence: UInt64 = 2
+        for uptime in [40.08, 40.16, 40.24, 40.32, 40.40] {
+            _ = tracker.update(
+                detections: [detection(centerX: 0.74, centerY: 0.5)],
+                sequence: sequence,
+                observedAtUptime: uptime
+            )
+            sequence += 1
+        }
+        XCTAssertTrue(tracker.hasUnresolvedRetiredLock)
+
+        let returned = tracker.update(
+            detections: [
+                detection(centerX: 0.73, centerY: 0.5),
                 detection(centerX: 0.32, centerY: 0.5),
             ],
-            sequence: 3,
-            observedAtUptime: 40.16
+            sequence: sequence,
+            observedAtUptime: 40.48
         )
         XCTAssertEqual(returned.lockedID, lockedID)
         XCTAssertNil(returned.lockedCandidate)
@@ -560,14 +604,15 @@ final class PersonTrackingPolicyTests: XCTestCase {
         )
         XCTAssertTrue(tracker.lock(on: returnedTarget.id))
         XCTAssertEqual(tracker.currentSnapshot.lockedID, returnedTarget.id)
+        XCTAssertFalse(tracker.hasUnresolvedRetiredLock)
 
         let afterReselection = tracker.update(
             detections: [
                 detection(centerX: 0.71, centerY: 0.5),
                 detection(centerX: 0.33, centerY: 0.5),
             ],
-            sequence: 4,
-            observedAtUptime: 40.24
+            sequence: sequence + 1,
+            observedAtUptime: 40.56
         )
         XCTAssertEqual(afterReselection.lockedCandidate?.id, returnedTarget.id)
         XCTAssertEqual(

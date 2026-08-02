@@ -163,6 +163,18 @@ enum GimbalRangeCalibrationPolicy {
     static let commandCompletionTimeout: TimeInterval = 3.5
     static let sampleTimeout: TimeInterval = 1.2
     static let maximumFreshSampleAge: TimeInterval = 0.45
+    /// A short pre-command window that must show a still scene on both axes.
+    /// Without it, a person walking through the frame makes every probe look
+    /// like verified gimbal motion even when the command never executed.
+    static let preStepStillnessGap: TimeInterval = 0.12
+    /// A step whose measured image shift falls below this fraction of the
+    /// running median of previously confirmed steps is treated as partial
+    /// travel (typically the mechanism nearing its end stop) and is not
+    /// credited as a full step.
+    static let minimumShiftFractionOfExpected = 0.45
+    /// The return leg aggregates up to this many verified outward steps into
+    /// one relative move at the same angular rate as the probes.
+    static let maximumReturnChunkSteps = 3
 
     static let yawStepDegrees = 5
     static let pitchStepDegrees = 2
@@ -215,7 +227,16 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
     private var latestMotionSample: GimbalMotionFrameSample?
     private var directionOriginSignature: GimbalMotionSignature?
     private var successfulSteps = 0
+    /// Steps whose motion the camera verified, including a final step the
+    /// operator declined to credit toward the envelope. The return leg must
+    /// undo physical travel, not the credited extent.
+    private var physicalSteps = 0
     private var pendingVerdict: PendingVerdict?
+    private var pendingShiftSign = 0
+    private var pendingShiftMagnitude = 0
+    private var directionShiftSign = 0
+    private var acceptedShiftMagnitudes: [Int] = []
+    private var directionNeedsRedo = false
     private var measurements: [GimbalCalibrationDirection: GimbalRangeMeasurement] = [:]
     private var safetyArmed = false
     private var appActive = true
@@ -296,20 +317,18 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
             }
             .store(in: &cancellables)
 
-        camera.$motionSample
-            .receive(on: RunLoop.main)
-            .sink { [weak self] sample in
-                guard let self, let sample,
-                      sample.sessionID == self.cameraSessionID,
-                      self.camera.isMotionCalibrationSessionValid(sample.sessionID)
-                else { return }
-                if let latest = self.latestMotionSample,
-                   sample.sequence <= latest.sequence {
-                    return
-                }
-                self.latestMotionSample = sample
+        // Direct main-thread callback; see CameraController.onMotionSample.
+        camera.onMotionSample = { [weak self] sample in
+            guard let self,
+                  sample.sessionID == self.cameraSessionID,
+                  self.camera.isMotionCalibrationSessionValid(sample.sessionID)
+            else { return }
+            if let latest = self.latestMotionSample,
+               sample.sequence <= latest.sequence {
+                return
             }
-            .store(in: &cancellables)
+            self.latestMotionSample = sample
+        }
 
         tracking.$enabled
             .receive(on: RunLoop.main)
@@ -378,7 +397,13 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         latestMotionSample = nil
         directionOriginSignature = nil
         successfulSteps = 0
+        physicalSteps = 0
         pendingVerdict = nil
+        pendingShiftSign = 0
+        pendingShiftMagnitude = 0
+        directionShiftSign = 0
+        acceptedShiftMagnitudes.removeAll(keepingCapacity: true)
+        directionNeedsRedo = false
         measurements.removeAll()
         result = nil
         envelopeIsActive = false
@@ -428,12 +453,29 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         let kind: GimbalRangeMeasurementKind
         switch pendingVerdict {
         case .moved:
-            acceptPendingMovedStep(direction)
+            // The operator chose to stop on this very step, usually because
+            // they saw something the camera did not. The step is therefore not
+            // credited toward the envelope, but its physical travel must still
+            // be undone on the return leg.
+            physicalSteps += 1
             kind = .operatorLimit
         case .noResponse, .inconclusive:
             kind = .unverifiedResponse
         }
         finishDirection(direction, kind: kind)
+    }
+
+    /// Re-runs the current probe after a noResponse/inconclusive verdict, so a
+    /// transient glitch (lighting, a person passing) does not force the whole
+    /// direction to end at the previous step.
+    func retryCurrentStep() {
+        guard isRunning,
+              sessionsAreValid,
+              awaitingStepDecision,
+              pendingVerdict != .moved,
+              let direction = currentDirection
+        else { return }
+        scheduleProbe(direction)
     }
 
     func confirmReturnedToCenter() {
@@ -449,6 +491,11 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
 
         awaitingCenterConfirmation = false
         centerCheckText = nil
+        if directionNeedsRedo {
+            directionNeedsRedo = false
+            beginDirection(completedDirection)
+            return
+        }
         if let index = GimbalCalibrationDirection.allCases.firstIndex(of: completedDirection),
            index + 1 < GimbalCalibrationDirection.allCases.count {
             beginDirection(GimbalCalibrationDirection.allCases[index + 1])
@@ -486,13 +533,20 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         try? await Task.sleep(
             nanoseconds: Self.nanoseconds(GimbalRangeCalibrationPolicy.baselineDuration)
         )
-        guard isCurrent(generation), !Task.isCancelled,
-              let last = await waitForFreshSample(
-                afterSequence: first.sequence,
-                timeout: GimbalRangeCalibrationPolicy.sampleTimeout,
-                generation: generation
-              )
-        else { return }
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        guard let last = await waitForFreshSample(
+            afterSequence: first.sequence,
+            timeout: GimbalRangeCalibrationPolicy.sampleTimeout,
+            generation: generation
+        ) else {
+            // Without this, a camera hiccup here left the coordinator running
+            // forever with no pending decision and no live task.
+            failIfCurrent(
+                generation,
+                message: "基线检查期间摄像头帧中断；全向验证未开始。"
+            )
+            return
+        }
 
         let horizontal = GimbalMotionAnalysis.estimate(
             reference: first.signature,
@@ -522,7 +576,13 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         currentDirection = direction
         currentVerifiedExtentDegrees = 0
         successfulSteps = 0
+        physicalSteps = 0
         pendingVerdict = nil
+        pendingShiftSign = 0
+        pendingShiftMagnitude = 0
+        directionShiftSign = 0
+        acceptedShiftMagnitudes.removeAll(keepingCapacity: true)
+        directionNeedsRedo = false
         awaitingStepDecision = false
         awaitingCenterConfirmation = false
         canContinueOutward = false
@@ -562,11 +622,50 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
             failIfCurrent(generation, message: "摄像头帧已中断；本次结果已作废。")
             return
         }
+        let targetExtent = currentVerifiedExtentDegrees + direction.stepDegrees
+
+        // The probe verdict is only meaningful against a scene that was still
+        // right before the command. A person walking through the frame would
+        // otherwise verify every step, even one the gimbal never executed.
+        try? await Task.sleep(
+            nanoseconds: Self.nanoseconds(GimbalRangeCalibrationPolicy.preStepStillnessGap)
+        )
+        guard isCurrent(generation), !Task.isCancelled else { return }
+        guard let still = await waitForFreshSample(
+            afterSequence: before.sequence,
+            timeout: GimbalRangeCalibrationPolicy.sampleTimeout,
+            generation: generation
+        ) else {
+            failIfCurrent(generation, message: "摄像头帧已中断；本次结果已作废。")
+            return
+        }
+        let preHorizontal = GimbalMotionAnalysis.estimate(
+            reference: before.signature,
+            current: still.signature,
+            axis: .horizontal
+        )
+        let preVertical = GimbalMotionAnalysis.estimate(
+            reference: before.signature,
+            current: still.signature,
+            axis: .vertical
+        )
+        guard case .noResponse = preHorizontal.verdict,
+              case .noResponse = preVertical.verdict
+        else {
+            // Nothing was commanded, so no STOP is needed; the operator can
+            // retry once the scene is still again.
+            presentStepDecision(
+                verdict: .inconclusive,
+                status: "步前画面不静止，已暂停本步",
+                response: "发送动作前画面已在变化（人员走动、光照或支架抖动）；请让场景静止后重试本步。"
+            )
+            updateProgress(for: direction, proposedExtent: targetExtent)
+            return
+        }
         if directionOriginSignature == nil {
-            directionOriginSignature = before.signature
+            directionOriginSignature = still.signature
         }
 
-        let targetExtent = currentVerifiedExtentDegrees + direction.stepDegrees
         statusText = "\(direction.title)探测至约 \(targetExtent)°"
         detailText = "正在发送单步动作；请随时观察碰撞、异响和线缆拉扯。"
         responseText = nil
@@ -589,7 +688,7 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
             failIfCurrent(generation, message: "自检步进未在限定时间内完成。")
             return
         }
-        let settleStartSequence = latestMotionSample?.sequence ?? before.sequence
+        let settleStartSequence = latestMotionSample?.sequence ?? still.sequence
         try? await Task.sleep(
             nanoseconds: Self.nanoseconds(
                 GimbalRangeCalibrationPolicy.postCommandSettleDuration
@@ -607,44 +706,138 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         }
 
         let estimate = GimbalMotionAnalysis.estimate(
-            reference: before.signature,
+            reference: still.signature,
             current: after.signature,
             axis: direction.axis
         )
-        awaitingStepDecision = true
+        let orthogonalEstimate = GimbalMotionAnalysis.estimate(
+            reference: still.signature,
+            current: after.signature,
+            axis: direction.axis == .horizontal ? .vertical : .horizontal
+        )
+        evaluateProbeOutcome(
+            direction,
+            estimate: estimate,
+            orthogonalEstimate: orthogonalEstimate,
+            targetExtent: targetExtent,
+            bluetoothSessionID: bluetoothSessionID
+        )
+        updateProgress(for: direction, proposedExtent: targetExtent)
+    }
+
+    private func evaluateProbeOutcome(
+        _ direction: GimbalCalibrationDirection,
+        estimate: GimbalMotionEstimate,
+        orthogonalEstimate: GimbalMotionEstimate,
+        targetExtent: Int,
+        bluetoothSessionID: UUID
+    ) {
         switch estimate.verdict {
         case .moved:
+            if case .moved = orthogonalEstimate.verdict {
+                stopForUnreliableStep(
+                    bluetoothSessionID: bluetoothSessionID,
+                    status: "检测到正交方向画面位移，已 STOP",
+                    response: "画面同时沿另一轴移动，装置可能被碰动或支架松动；请检查后重试本步。"
+                )
+                return
+            }
+            let shiftSign = estimate.axisShift >= 0 ? 1 : -1
+            if directionShiftSign != 0, shiftSign != directionShiftSign {
+                stopForUnreliableStep(
+                    bluetoothSessionID: bluetoothSessionID,
+                    status: "画面位移方向与此前相反，已 STOP",
+                    response: "本步位移与本方向此前步幅方向相反，疑似回弹、二次居中或误检；不能计入行程。"
+                )
+                return
+            }
+            if acceptedShiftMagnitudes.count >= 2 {
+                let expected = Double(medianAcceptedShiftMagnitude)
+                let fraction = Double(abs(estimate.axisShift)) / max(expected, 1)
+                if fraction < GimbalRangeCalibrationPolicy.minimumShiftFractionOfExpected {
+                    _ = bluetooth.stopRangeCalibrationMotion(
+                        session: bluetoothSessionID,
+                        reason: "自检位移明显小于预期 STOP"
+                    )
+                    presentStepDecision(
+                        verdict: .inconclusive,
+                        status: "画面位移明显小于此前步幅，已 STOP",
+                        response: "实际位移约为此前每步的 \(Int(fraction * 100))%，疑似接近端点或受阻；该步不计入行程，请在此结束该方向。"
+                    )
+                    return
+                }
+            }
             pendingVerdict = .moved
+            pendingShiftSign = shiftSign
+            pendingShiftMagnitude = abs(estimate.axisShift)
+            awaitingStepDecision = true
             canContinueOutward = true
             statusText = "等待确认：\(direction.title)约 \(targetExtent)°"
             responseText = "摄像头检测到同轴画面位移。请确认实体确实完成动作且仍有安全余量。"
+            detailText = "每一步都必须由现场人员确认；画面分析不能证明机械端点。"
         case .noResponse:
-            pendingVerdict = .noResponse
-            canContinueOutward = false
-            _ = bluetooth.stopRangeCalibrationMotion(
-                session: bluetoothSessionID,
-                reason: "自检无可验证画面响应 STOP"
+            stopForUnreliableStep(
+                bluetoothSessionID: bluetoothSessionID,
+                verdict: .noResponse,
+                status: "\(direction.title)无可验证响应，已 STOP",
+                response: "这可能是端点、阻塞、线缆受力、BLE 未执行或摄像头未随云台运动；不能继续向外。"
             )
-            statusText = "\(direction.title)无可验证响应，已 STOP"
-            responseText = "这可能是端点、阻塞、线缆受力、BLE 未执行或摄像头未随云台运动；不能继续向外。"
         case let .inconclusive(reason):
-            pendingVerdict = .inconclusive
-            canContinueOutward = false
-            _ = bluetooth.stopRangeCalibrationMotion(
-                session: bluetoothSessionID,
-                reason: "自检画面结论不可靠 STOP"
+            stopForUnreliableStep(
+                bluetoothSessionID: bluetoothSessionID,
+                status: "画面判断不可靠，已 STOP",
+                response: "\(reason) 可重试本步、按当前已确认行程返程，或取消后改善场景重试。"
             )
-            statusText = "画面判断不可靠，已 STOP"
-            responseText = "\(reason) 只能按当前已确认行程返程，或取消后改善场景重试。"
         }
+    }
+
+    private func stopForUnreliableStep(
+        bluetoothSessionID: UUID,
+        verdict: PendingVerdict = .inconclusive,
+        status: String,
+        response: String
+    ) {
+        _ = bluetooth.stopRangeCalibrationMotion(
+            session: bluetoothSessionID,
+            reason: "自检画面结论不可靠 STOP"
+        )
+        presentStepDecision(verdict: verdict, status: status, response: response)
+    }
+
+    private func presentStepDecision(
+        verdict: PendingVerdict,
+        status: String,
+        response: String
+    ) {
+        pendingVerdict = verdict
+        pendingShiftSign = 0
+        pendingShiftMagnitude = 0
+        awaitingStepDecision = true
+        canContinueOutward = false
+        statusText = status
+        responseText = response
         detailText = "每一步都必须由现场人员确认；画面分析不能证明机械端点。"
-        updateProgress(for: direction, proposedExtent: targetExtent)
+    }
+
+    private var medianAcceptedShiftMagnitude: Int {
+        let sorted = acceptedShiftMagnitudes.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        return sorted[sorted.count / 2]
     }
 
     private func acceptPendingMovedStep(_ direction: GimbalCalibrationDirection) {
         successfulSteps += 1
+        physicalSteps += 1
         currentVerifiedExtentDegrees = successfulSteps * direction.stepDegrees
+        if pendingShiftSign != 0 {
+            directionShiftSign = pendingShiftSign
+        }
+        if pendingShiftMagnitude > 0 {
+            acceptedShiftMagnitudes.append(pendingShiftMagnitude)
+        }
         pendingVerdict = nil
+        pendingShiftSign = 0
+        pendingShiftMagnitude = 0
         awaitingStepDecision = false
         canContinueOutward = false
         responseText = nil
@@ -661,7 +854,15 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
             direction: direction
         )
         guard usable > 0 else {
-            fail("\(direction.title)没有形成可用安全余量；本次结果已作废。", sendStop: true)
+            // A weak direction no longer discards the whole session: return to
+            // origin, then re-run the same direction after the operator
+            // confirms recentering. Other directions' measurements survive.
+            directionNeedsRedo = true
+            awaitingStepDecision = false
+            canContinueOutward = false
+            pendingVerdict = nil
+            responseText = "\(direction.title)确认行程不足（余量需超过 \(direction.safetyMarginDegrees)°）；回正确认后将重试该方向。"
+            beginReturn(direction)
             return
         }
         measurements[direction] = GimbalRangeMeasurement(
@@ -695,36 +896,72 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         statusText = "正在按已确认路径从\(direction.title)返程"
         detailText = "返程完成后仍需人工确认回正；应用不会仅凭指令积分认定原点。"
 
-        for completed in 0..<successfulSteps {
+        // The return aggregates verified steps into larger relative moves at
+        // the same angular rate as the probes (stepDegrees per second), which
+        // cuts several interlock waits per direction.
+        var remainingDegrees = physicalSteps * direction.stepDegrees
+        let yawSign = direction.oppositeYawDegrees == 0
+            ? 0
+            : direction.oppositeYawDegrees / direction.stepDegrees
+        let pitchSign = direction.oppositePitchDegrees == 0
+            ? 0
+            : direction.oppositePitchDegrees / direction.stepDegrees
+        while remainingDegrees > 0 {
             guard isCurrent(generation), !Task.isCancelled else { return }
+            let chunkDegrees = min(
+                remainingDegrees,
+                direction.stepDegrees * GimbalRangeCalibrationPolicy.maximumReturnChunkSteps
+            )
+            let durationTenths = UInt8(
+                min(40, max(10, chunkDegrees * 10 / direction.stepDegrees))
+            )
+            let motionTimeout = max(
+                GimbalRangeCalibrationPolicy.commandCompletionTimeout,
+                Double(durationTenths) / 10.0 + 1.5
+            )
             guard await waitForNudgeAvailability(
-                timeout: GimbalRangeCalibrationPolicy.commandCompletionTimeout,
+                timeout: motionTimeout,
                 generation: generation
             ) else {
                 failIfCurrent(generation, message: "返程互锁超时；请人工回正。")
                 return
             }
             let submitted = bluetooth.sendRangeCalibrationNudge(
-                yawDegrees: direction.oppositeYawDegrees,
-                pitchDegrees: direction.oppositePitchDegrees,
-                label: "全向验证返程 · \(direction.title) \(completed + 1)/\(successfulSteps)",
+                yawDegrees: yawSign * chunkDegrees,
+                pitchDegrees: pitchSign * chunkDegrees,
+                durationTenths: durationTenths,
+                label: "全向验证返程 · \(direction.title) 剩余 \(remainingDegrees)°",
                 session: bluetoothSessionID
             )
             guard submitted,
                   await waitForNudgeCompletion(
-                    timeout: GimbalRangeCalibrationPolicy.commandCompletionTimeout,
+                    timeout: motionTimeout,
                     generation: generation
                   )
             else {
                 failIfCurrent(generation, message: "返程动作未能可靠提交；请人工回正。")
                 return
             }
+            remainingDegrees -= chunkDegrees
         }
 
         guard isCurrent(generation), !Task.isCancelled else { return }
+        // The origin comparison must use a frame captured after the last
+        // return move settled, never a stale or mid-motion sample.
+        try? await Task.sleep(
+            nanoseconds: Self.nanoseconds(
+                GimbalRangeCalibrationPolicy.postCommandSettleDuration
+            )
+        )
+        let settledSample = await waitForFreshSample(
+            afterSequence: latestMotionSample?.sequence,
+            timeout: GimbalRangeCalibrationPolicy.sampleTimeout,
+            generation: generation
+        )
+        guard isCurrent(generation), !Task.isCancelled else { return }
         let originCheck: String
         if let origin = directionOriginSignature,
-           let current = latestMotionSample?.signature {
+           let current = settledSample?.signature {
             let estimate = GimbalMotionAnalysis.estimate(
                 reference: origin,
                 current: current,
@@ -743,6 +980,7 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         }
 
         successfulSteps = 0
+        physicalSteps = 0
         currentVerifiedExtentDegrees = 0
         awaitingCenterConfirmation = true
         centerCheckText = originCheck
@@ -767,6 +1005,17 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         )
         guard let envelope = completedResult.envelope else {
             fail("验证结果无法形成有效安全包络。", sendStop: true)
+            return
+        }
+        // Validate against the install caps while the sessions are still alive:
+        // once they are torn down, a failed install can no longer route its
+        // STOP through the calibration lease.
+        guard envelope.leftYawTenths <= 900,
+              envelope.rightYawTenths <= 900,
+              envelope.upPitchTenths <= 300,
+              envelope.downPitchTenths <= 300
+        else {
+            fail("验证结果超出可启用上限；本次结果已作废。", sendStop: true)
             return
         }
 
@@ -822,11 +1071,22 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
                 reason: message,
                 sendStop: sendStop
             )
+        } else if sendStop, bluetooth.state.isReady {
+            // The calibration lease may already be torn down (e.g. a failed
+            // envelope install right after completion); the requested STOP
+            // must still go out.
+            bluetooth.stopMotion(reason: message)
         }
         latestMotionSample = nil
         directionOriginSignature = nil
         successfulSteps = 0
+        physicalSteps = 0
         pendingVerdict = nil
+        pendingShiftSign = 0
+        pendingShiftMagnitude = 0
+        directionShiftSign = 0
+        acceptedShiftMagnitudes.removeAll(keepingCapacity: true)
+        directionNeedsRedo = false
         measurements.removeAll()
         result = nil
         isRunning = false

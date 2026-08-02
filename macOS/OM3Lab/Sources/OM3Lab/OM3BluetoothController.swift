@@ -1,3 +1,4 @@
+import AppKit
 import CoreBluetooth
 import Foundation
 
@@ -106,6 +107,17 @@ final class OM3BluetoothController: NSObject, ObservableObject {
     @Published private(set) var logs: [OM3LogEntry] = [
         OM3LogEntry(timestamp: Date(), message: "待机：请先安装负载、完成配平并整理线缆。"),
     ]
+    /// Per-chunk TX hex and raw RX notifications reach ~30 log lines per
+    /// second in the fast tracking profile; each one used to shift a
+    /// @Published array on the main thread. Off by default.
+    @Published private(set) var verboseLogging = UserDefaults.standard.bool(
+        forKey: "om3.verboseLogging"
+    )
+
+    func setVerboseLogging(_ enabled: Bool) {
+        verboseLogging = enabled
+        UserDefaults.standard.set(enabled, forKey: "om3.verboseLogging")
+    }
 
     private enum PacketCompletion {
         case none
@@ -190,6 +202,8 @@ final class OM3BluetoothController: NSObject, ObservableObject {
     private var trackingYawTravelTenths = 0
     private var trackingPitchTravelTenths = 0
 
+    private var terminationObserver: NSObjectProtocol?
+
     override init() {
         super.init()
         loadRememberedDevice()
@@ -198,6 +212,34 @@ final class OM3BluetoothController: NSObject, ObservableObject {
             queue: .main,
             options: [CBCentralManagerOptionShowPowerAlertKey: true]
         )
+        // SwiftUI's onDisappear is not reliably delivered on quit, so the
+        // best-effort STOP must also hang off app termination. Power-off
+        // remains the only real failsafe.
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sendBestEffortStopBeforeTermination()
+        }
+    }
+
+    deinit {
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+        }
+    }
+
+    private func sendBestEffortStopBeforeTermination() {
+        guard state.isReady else { return }
+        motionSafetyArmed = false
+        trackingOriginConfirmed = false
+        invalidateRangeCalibration()
+        discardCalibratedTrackingEnvelope(reason: nil)
+        enqueueStop(label: "应用退出 STOP")
+        // One brief run-loop pass gives CoreBluetooth a chance to hand the
+        // frame to the controller before the process exits.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.15))
     }
 
     func startScanning() {
@@ -402,6 +444,7 @@ final class OM3BluetoothController: NSObject, ObservableObject {
     func sendRangeCalibrationNudge(
         yawDegrees: Int,
         pitchDegrees: Int,
+        durationTenths: UInt8 = OM3Protocol.testDurationTenths,
         label: String,
         session: UUID
     ) -> Bool {
@@ -417,15 +460,21 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         }
 
         do {
-            let frame = try OM3Protocol.relativeNudge(
-                yawDegrees: yawDegrees,
-                pitchDegrees: pitchDegrees
+            let frame = try OM3Protocol.relativeMove(
+                yawTenths: yawDegrees * 10,
+                pitchTenths: pitchDegrees * 10,
+                durationTenths: durationTenths
             )
             let token = lockNudges()
+            // The interlock must outlast the declared motion; aggregated
+            // return moves run longer than the standard 1.0-second nudge.
             let submitted = enqueue(
                 frame,
                 label: label,
-                completion: .manual(token: token, delay: 1.15),
+                completion: .manual(
+                    token: token,
+                    delay: Double(durationTenths) / 10.0 + 0.15
+                ),
                 expiresAtUptime: nil
             )
             if !submitted,
@@ -1070,15 +1119,19 @@ final class OM3BluetoothController: NSObject, ObservableObject {
                 } == true
             let chunk = packet.chunks[packet.nextChunk]
             peripheral.writeValue(chunk, for: characteristic, type: .withoutResponse)
-            appendLog(
-                "TX \(packet.label) [\(packet.nextChunk + 1)/2] · \(OM3Protocol.hex(chunk))"
-            )
+            if verboseLogging {
+                appendLog(
+                    "TX \(packet.label) [\(packet.nextChunk + 1)/2] · \(OM3Protocol.hex(chunk))"
+                )
+            }
             packet.nextChunk += 1
 
             if packet.nextChunk < packet.chunks.count {
                 packets.insert(packet, at: 0)
             } else {
-                appendLog("\(packet.label) 已交给 CoreBluetooth（无设备 ACK）。")
+                if verboseLogging {
+                    appendLog("\(packet.label) 已交给 CoreBluetooth（无设备 ACK）。")
+                }
                 var trackingMotionWasCommitted = false
                 if expiredAfterFirstChunk,
                    case let .tracking(session, _, _, motionDelta) = packet.completion {
@@ -1617,7 +1670,9 @@ extension OM3BluetoothController: CBPeripheralDelegate {
             return
         }
         guard let value = characteristic.value else { return }
-        appendLog("RX FFF4 · \(OM3Protocol.hex(value, limit: 24))")
+        if verboseLogging {
+            appendLog("RX FFF4 · \(OM3Protocol.hex(value, limit: 24))")
+        }
     }
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {

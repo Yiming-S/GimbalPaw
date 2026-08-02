@@ -5,6 +5,8 @@ import SwiftUI
 
 final class CameraPreviewNSView: NSView {
     let previewLayer: AVCaptureVideoPreviewLayer
+    var onSelectCandidate: ((PersonCandidateID) -> Void)?
+
     private let candidateBoxLayer = CAShapeLayer()
     private let selectedPersonBoxLayer = CAShapeLayer()
     private let personCenterLayer = CAShapeLayer()
@@ -12,7 +14,16 @@ final class CameraPreviewNSView: NSView {
     private var personCandidates: [PersonCandidate] = []
     private var selectedPersonID: PersonCandidateID?
     private var candidateLabelLayers: [PersonCandidateID: CATextLayer] = [:]
+    private var candidateLabelStates: [PersonCandidateID: LabelState] = [:]
+    private var candidateHitTargets: [(id: PersonCandidateID, rect: CGRect)] = []
     private var trackingEnabled = false
+
+    private struct LabelState: Equatable {
+        let text: String
+        let selected: Bool
+        let frame: CGRect
+        let contentsScale: CGFloat
+    }
 
     init(session: AVCaptureSession) {
         previewLayer = AVCaptureVideoPreviewLayer(session: session)
@@ -65,6 +76,13 @@ final class CameraPreviewNSView: NSView {
         candidates: [PersonCandidate],
         selectedPersonID: PersonCandidateID?
     ) {
+        // SwiftUI calls updateNSView for unrelated parent re-renders too;
+        // rebuilding every path and re-rasterizing every label costs real CPU
+        // at the vision cadence, so bail when nothing changed.
+        guard enabled != trackingEnabled
+            || candidates != personCandidates
+            || selectedPersonID != self.selectedPersonID
+        else { return }
         trackingEnabled = enabled
         personCandidates = candidates
         self.selectedPersonID = selectedPersonID
@@ -72,6 +90,22 @@ final class CameraPreviewNSView: NSView {
         CATransaction.setDisableActions(true)
         updateTrackingLayers()
         CATransaction.commit()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Prefer the smallest box under the cursor, so a person standing in
+        // front of another remains individually selectable.
+        let hit = candidateHitTargets
+            .filter { $0.rect.insetBy(dx: -6, dy: -6).contains(point) }
+            .min { lhs, rhs in
+                lhs.rect.width * lhs.rect.height < rhs.rect.width * rhs.rect.height
+            }
+        guard let hit else {
+            super.mouseDown(with: event)
+            return
+        }
+        onSelectCandidate?(hit.id)
     }
 
     private func updateTrackingLayers() {
@@ -85,6 +119,7 @@ final class CameraPreviewNSView: NSView {
             selectedPersonBoxLayer.path = nil
             personCenterLayer.path = nil
             frameCenterLayer.path = nil
+            candidateHitTargets.removeAll(keepingCapacity: true)
             removeAllCandidateLabels()
             return
         }
@@ -101,6 +136,10 @@ final class CameraPreviewNSView: NSView {
         let selectedPath = CGMutablePath()
         let centerPath = CGMutablePath()
         var visibleIDs = Set<PersonCandidateID>()
+        let videoRect = previewLayer.layerRectConverted(
+            fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1)
+        )
+        candidateHitTargets.removeAll(keepingCapacity: true)
 
         for candidate in personCandidates {
             visibleIDs.insert(candidate.id)
@@ -134,13 +173,20 @@ final class CameraPreviewNSView: NSView {
             } else {
                 candidatePath.addPath(box)
             }
-            updateLabel(for: candidate, in: layerRect, selected: isSelected)
+            candidateHitTargets.append((id: candidate.id, rect: layerRect))
+            updateLabel(
+                for: candidate,
+                in: layerRect,
+                videoRect: videoRect,
+                selected: isSelected
+            )
         }
 
         let staleLabelIDs = candidateLabelLayers.keys.filter { !visibleIDs.contains($0) }
         for id in staleLabelIDs {
             candidateLabelLayers[id]?.removeFromSuperlayer()
             candidateLabelLayers.removeValue(forKey: id)
+            candidateLabelStates.removeValue(forKey: id)
         }
         candidateBoxLayer.path = candidatePath
         selectedPersonBoxLayer.path = selectedPath
@@ -150,8 +196,37 @@ final class CameraPreviewNSView: NSView {
     private func updateLabel(
         for candidate: PersonCandidate,
         in layerRect: CGRect,
+        videoRect: CGRect,
         selected: Bool
     ) {
+        let text = selected ? "锁定 \(candidate.id.rawValue)" : candidate.id.title
+        let width: CGFloat = selected ? 58 : 52
+        // AppKit layer space is not flipped, so the on-screen top of the box is
+        // its maxY edge; clamping against the video rect keeps labels off the
+        // letterbox bars.
+        let clampRect = videoRect.isEmpty ? previewLayer.bounds : videoRect
+        let x = min(
+            max(clampRect.minX + 4, layerRect.minX),
+            max(clampRect.minX + 4, clampRect.maxX - width - 4)
+        )
+        let y = min(
+            max(clampRect.minY + 4, layerRect.maxY - 22),
+            max(clampRect.minY + 4, clampRect.maxY - 22)
+        )
+        let frame = CGRect(x: x, y: y, width: width, height: 18)
+        let contentsScale = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2
+        let desiredState = LabelState(
+            text: text,
+            selected: selected,
+            frame: frame,
+            contentsScale: contentsScale
+        )
+        // CATextLayer re-rasterizes on every property write (string is Any?,
+        // so it cannot diff internally); only touch what actually changed.
+        guard candidateLabelStates[candidate.id] != desiredState else { return }
+
         let label: CATextLayer
         if let existing = candidateLabelLayers[candidate.id] {
             label = existing
@@ -164,24 +239,25 @@ final class CameraPreviewNSView: NSView {
             previewLayer.addSublayer(label)
             candidateLabelLayers[candidate.id] = label
         }
-        label.contentsScale = window?.backingScaleFactor
-            ?? NSScreen.main?.backingScaleFactor
-            ?? 2
-        label.string = selected ? "锁定 \(candidate.id.rawValue)" : candidate.id.title
-        label.foregroundColor = selected ? NSColor.black.cgColor : NSColor.white.cgColor
-        label.backgroundColor = selected
-            ? NSColor.systemGreen.cgColor
-            : NSColor.systemCyan.withAlphaComponent(0.85).cgColor
-        let width: CGFloat = selected ? 58 : 52
-        let x = min(
-            max(4, layerRect.minX),
-            max(4, previewLayer.bounds.maxX - width - 4)
-        )
-        let y = min(
-            max(4, layerRect.minY + 4),
-            max(4, previewLayer.bounds.maxY - 22)
-        )
-        label.frame = CGRect(x: x, y: y, width: width, height: 18)
+        let previousState = candidateLabelStates[candidate.id]
+        if previousState?.contentsScale != contentsScale {
+            label.contentsScale = contentsScale
+        }
+        if previousState?.text != text {
+            label.string = text
+        }
+        if previousState?.selected != selected {
+            label.foregroundColor = selected
+                ? NSColor.black.cgColor
+                : NSColor.white.cgColor
+            label.backgroundColor = selected
+                ? NSColor.systemGreen.cgColor
+                : NSColor.systemCyan.withAlphaComponent(0.85).cgColor
+        }
+        if previousState?.frame != frame {
+            label.frame = frame
+        }
+        candidateLabelStates[candidate.id] = desiredState
     }
 
     private func removeAllCandidateLabels() {
@@ -189,6 +265,7 @@ final class CameraPreviewNSView: NSView {
             label.removeFromSuperlayer()
         }
         candidateLabelLayers.removeAll(keepingCapacity: true)
+        candidateLabelStates.removeAll(keepingCapacity: true)
     }
 }
 
@@ -197,9 +274,11 @@ struct CameraPreview: NSViewRepresentable {
     let personCandidates: [PersonCandidate]
     let selectedPersonID: PersonCandidateID?
     let trackingEnabled: Bool
+    var onSelectCandidate: ((PersonCandidateID) -> Void)?
 
     func makeNSView(context: Context) -> CameraPreviewNSView {
         let view = CameraPreviewNSView(session: session)
+        view.onSelectCandidate = onSelectCandidate
         view.updateTracking(
             enabled: trackingEnabled,
             candidates: personCandidates,
@@ -212,6 +291,7 @@ struct CameraPreview: NSViewRepresentable {
         if nsView.previewLayer.session !== session {
             nsView.previewLayer.session = session
         }
+        nsView.onSelectCandidate = onSelectCandidate
         nsView.updateTracking(
             enabled: trackingEnabled,
             candidates: personCandidates,

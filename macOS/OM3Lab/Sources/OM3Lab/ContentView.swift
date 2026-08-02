@@ -1,71 +1,91 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 
 struct ContentView: View {
+    // Only `bluetooth` is observed at the window level (low-frequency state).
+    // The vision-rate objects are passed through as plain references so their
+    // ~12.5 Hz updates re-render only the leaf views that read them.
     @ObservedObject var bluetooth: OM3BluetoothController
-    @ObservedObject var camera: CameraController
-    @ObservedObject var tracking: PersonTrackingCoordinator
-    @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
+    let camera: CameraController
+    let tracking: PersonTrackingCoordinator
+    let calibration: GimbalRangeCalibrationCoordinator
     @Environment(\.scenePhase) private var scenePhase
-    @State private var safetyArmed = false
+    @State private var autoStopNotice: String?
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            if let autoStopNotice {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(autoStopNotice)
+                        .font(.caption)
+                    Spacer()
+                    Button("知道了") {
+                        self.autoStopNotice = nil
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                .background(.orange.opacity(0.12))
+            }
             Divider()
 
             HSplitView {
-                CameraPanel(camera: camera, tracking: tracking)
+                CameraPanel(
+                    camera: camera,
+                    tracking: tracking,
+                    calibration: calibration
+                )
                     .frame(minWidth: 610, idealWidth: 760)
 
                 ControlPanel(
                     bluetooth: bluetooth,
                     camera: camera,
                     tracking: tracking,
-                    calibration: calibration,
-                    safetyArmed: $safetyArmed
+                    calibration: calibration
                 )
                     .frame(minWidth: 390, idealWidth: 440, maxWidth: 520)
             }
         }
         .frame(minWidth: 1080, minHeight: 700)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onChange(of: bluetooth.state) { _, newState in
-            if !newState.isReady {
-                safetyArmed = false
-            }
-        }
+        // The bluetooth controller owns the armed state; the UI only mirrors it.
+        // A rejected arm request therefore never leaves a latched-on switch.
         .onChange(of: bluetooth.motionSafetyArmed) { _, armed in
-            if !armed {
-                safetyArmed = false
-            }
-        }
-        .onChange(of: safetyArmed) { _, armed in
-            bluetooth.setMotionSafetyArmed(armed)
             tracking.setSafetyArmed(armed)
             calibration.setSafetyArmed(armed)
+            if armed {
+                autoStopNotice = nil
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
+                let hadActiveMotion = tracking.enabled
+                    || calibration.isRunning
+                    || bluetooth.motionSafetyArmed
                 tracking.setAppActive(false, sendStopOnDisable: false)
                 calibration.setAppActive(false, sendStopOnDisable: false)
                 bluetooth.bestEffortStopWhenAppBecomesInactive()
-                safetyArmed = false
+                if hadActiveMotion {
+                    autoStopNotice = "应用失去焦点时已自动停止运动并锁定安全确认；返回后请检查云台姿态，再重新打开安全确认。"
+                }
             } else {
                 tracking.setAppActive(true)
                 calibration.setAppActive(true)
             }
         }
         .onAppear {
-            bluetooth.setMotionSafetyArmed(safetyArmed)
-            tracking.setSafetyArmed(safetyArmed)
+            tracking.setSafetyArmed(bluetooth.motionSafetyArmed)
             tracking.setAppActive(scenePhase == .active)
-            calibration.setSafetyArmed(safetyArmed)
+            calibration.setSafetyArmed(bluetooth.motionSafetyArmed)
             calibration.setAppActive(scenePhase == .active)
         }
         .onDisappear {
-            let shouldSendStop = safetyArmed
-                || bluetooth.motionSafetyArmed
+            let shouldSendStop = bluetooth.motionSafetyArmed
                 || tracking.enabled
                 || calibration.isRunning
             tracking.setAppActive(false, sendStopOnDisable: false)
@@ -73,7 +93,6 @@ struct ContentView: View {
             if shouldSendStop {
                 bluetooth.bestEffortStopWhenAppBecomesInactive()
             }
-            safetyArmed = false
             camera.stop()
         }
     }
@@ -115,7 +134,8 @@ struct ContentView: View {
 
 private struct CameraPanel: View {
     @ObservedObject var camera: CameraController
-    @ObservedObject var tracking: PersonTrackingCoordinator
+    let tracking: PersonTrackingCoordinator
+    let calibration: GimbalRangeCalibrationCoordinator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -123,34 +143,21 @@ private struct CameraPanel: View {
                 Label("USB 摄像头", systemImage: "video.fill")
                     .font(.headline)
                 Spacer()
-                if tracking.enabled {
-                    StatusBadge(
-                        text: tracking.state.title,
-                        color: tracking.state.statusColor,
-                        symbol: tracking.selectedPersonDetection == nil
-                            ? "person.crop.circle.badge.questionmark"
-                            : "person.crop.rectangle"
-                    )
-                }
+                TrackingStateBadge(tracking: tracking)
                 StatusBadge(
                     text: camera.status.title,
                     color: camera.status.statusColor,
                     symbol: camera.status.isRunning ? "record.circle.fill" : "video.slash"
                 )
+                .help(camera.status.title)
             }
 
             ZStack {
                 RoundedRectangle(cornerRadius: 14)
                     .fill(.black)
 
-                CameraPreview(
-                    session: camera.session,
-                    personCandidates: tracking.visiblePeople,
-                    selectedPersonID: tracking.selectedPersonID,
-                    trackingEnabled: camera.personTrackingEnabled
-                )
+                TrackingCameraPreview(session: camera.session, tracking: tracking)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .accessibilityLabel(cameraPreviewAccessibilityLabel)
 
                 if !camera.status.isRunning {
                     VStack(spacing: 12) {
@@ -174,54 +181,11 @@ private struct CameraPanel: View {
             }
             .frame(minHeight: 390)
 
-            HStack(spacing: 10) {
-                if camera.devices.isEmpty {
-                    Button {
-                        camera.requestAccessAndRefresh()
-                    } label: {
-                        Label("启用并查找摄像头", systemImage: "video.badge.plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    Picker(
-                        "设备",
-                        selection: Binding(
-                            get: { camera.selectedDeviceID ?? "" },
-                            set: { camera.selectAndStart($0) }
-                        )
-                    ) {
-                        ForEach(camera.devices) { device in
-                            Text(device.name).tag(device.id)
-                        }
-                    }
-                    .frame(maxWidth: 310)
-
-                    Button(camera.status.isRunning ? "重新启动" : "开始预览") {
-                        camera.startSelectedOrFirst()
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-
-                Button {
-                    camera.refreshDevices()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("刷新外置摄像头列表")
-
-                Button("停止") {
-                    camera.stop()
-                }
-                .disabled(!camera.status.isRunning)
-
-                Spacer()
-
-                if camera.status == .denied {
-                    Button("打开隐私设置") {
-                        openCameraPrivacySettings()
-                    }
-                }
-            }
+            CameraControlsRow(
+                camera: camera,
+                tracking: tracking,
+                calibration: calibration
+            )
 
             WiringStrip()
         }
@@ -232,21 +196,60 @@ private struct CameraPanel: View {
         switch camera.status {
         case .denied:
             return "请允许 OM3 Lab 使用摄像头，然后返回应用刷新设备列表。"
-        case let .error(message):
-            return message
+        case .error:
+            return "请检查 USB 连接与占用该摄像头的其他应用，然后重新启动预览。"
         default:
             return "摄像头 USB 线直接连接 Mac mini；OM3 不传输画面。"
         }
     }
+}
 
-    private func openCameraPrivacySettings() {
-        guard let url = URL(
-            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera"
-        ) else { return }
-        NSWorkspace.shared.open(url)
+/// Leaf view: the only camera-panel element that re-renders on tracking-state
+/// changes.
+private struct TrackingStateBadge: View {
+    @ObservedObject var tracking: PersonTrackingCoordinator
+
+    var body: some View {
+        if tracking.enabled {
+            StatusBadge(
+                text: tracking.state.title,
+                color: tracking.state.statusColor,
+                symbol: tracking.selectedPersonDetection == nil
+                    ? "person.crop.circle.badge.questionmark"
+                    : "person.crop.rectangle"
+            )
+            .help(tracking.state.title)
+        }
+    }
+}
+
+/// Leaf view around the AppKit preview: candidate boxes update at the vision
+/// cadence without touching the rest of the camera panel. Clicking a drawn box
+/// selects that person; pause states surface as an overlay banner with their
+/// resume/exit action, instead of a truncated caption further down the page.
+private struct TrackingCameraPreview: View {
+    let session: AVCaptureSession
+    @ObservedObject var tracking: PersonTrackingCoordinator
+
+    var body: some View {
+        CameraPreview(
+            session: session,
+            personCandidates: tracking.visiblePeople,
+            selectedPersonID: tracking.selectedPersonID,
+            trackingEnabled: tracking.enabled,
+            onSelectCandidate: { candidateID in
+                guard tracking.canChangePersonSelection else { return }
+                tracking.selectPerson(candidateID)
+            }
+        )
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(.updatesFrequently)
+        .overlay(alignment: .top) {
+            TrackingPauseBanner(tracking: tracking)
+        }
     }
 
-    private var cameraPreviewAccessibilityLabel: String {
+    private var accessibilityLabel: String {
         guard tracking.enabled else { return "USB 摄像头实时预览" }
         let count = tracking.visiblePeople.count
         if let selected = tracking.selectedPersonID {
@@ -259,14 +262,172 @@ private struct CameraPanel: View {
     }
 }
 
-private struct ControlPanel: View {
-    @ObservedObject var bluetooth: OM3BluetoothController
+private struct TrackingPauseBanner: View {
+    @ObservedObject var tracking: PersonTrackingCoordinator
+
+    var body: some View {
+        switch tracking.state {
+        case let .searchPaused(reason):
+            banner(
+                icon: "pause.circle.fill",
+                title: "扫描已暂停",
+                message: reason,
+                tint: .orange
+            ) {
+                if tracking.canResumeSearch {
+                    Button {
+                        tracking.resumeSearch()
+                    } label: {
+                        Label("继续扫描", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+        case let .motionPaused(reason):
+            banner(
+                icon: "exclamationmark.octagon.fill",
+                title: "运动已暂停",
+                message: "\(reason)。结束本次跟踪后，请人工回正并重新打开运动安全确认。",
+                tint: .red
+            ) {
+                Button("结束本次跟踪") {
+                    tracking.setEnabled(false)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        default:
+            EmptyView()
+        }
+    }
+
+    private func banner(
+        icon: String,
+        title: String,
+        message: String,
+        tint: Color,
+        @ViewBuilder actions: () -> some View
+    ) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            actions()
+        }
+        .padding(10)
+        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(tint.opacity(0.5))
+        }
+        .padding(10)
+    }
+}
+
+private struct CameraControlsRow: View {
     @ObservedObject var camera: CameraController
     @ObservedObject var tracking: PersonTrackingCoordinator
     @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
-    @Binding var safetyArmed: Bool
+
+    /// Switching or stopping the camera silently kills the tracking or
+    /// calibration session, so these controls lock while one is running.
+    private var controlsLocked: Bool {
+        tracking.enabled || calibration.isRunning
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if camera.devices.isEmpty {
+                Button {
+                    camera.requestAccessAndRefresh()
+                } label: {
+                    Label("启用并查找摄像头", systemImage: "video.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Picker(
+                    "设备",
+                    selection: Binding(
+                        get: { camera.selectedDeviceID ?? "" },
+                        set: { deviceID in
+                            guard deviceID != camera.selectedDeviceID else { return }
+                            camera.selectAndStart(deviceID)
+                        }
+                    )
+                ) {
+                    if camera.selectedDeviceID == nil {
+                        Text("未选择").tag("")
+                    }
+                    ForEach(camera.devices) { device in
+                        Text(device.name).tag(device.id)
+                    }
+                }
+                .frame(maxWidth: 310)
+                .disabled(controlsLocked)
+
+                Button(camera.status.isRunning ? "重新启动" : "开始预览") {
+                    camera.startSelectedOrFirst()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(controlsLocked)
+            }
+
+            Button {
+                camera.refreshDevices()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .help("刷新外置摄像头列表")
+            .accessibilityLabel("刷新外置摄像头列表")
+            .disabled(controlsLocked)
+
+            Button("停止") {
+                camera.stop()
+            }
+            .disabled(!camera.status.isRunning || controlsLocked)
+
+            if controlsLocked {
+                Text("跟踪/验证运行中，摄像头切换已锁定")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if camera.status == .denied {
+                Button("打开隐私设置") {
+                    openCameraPrivacySettings()
+                }
+            }
+        }
+    }
+
+    private func openCameraPrivacySettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+}
+
+private struct ControlPanel: View {
+    @ObservedObject var bluetooth: OM3BluetoothController
+    @ObservedObject var camera: CameraController
+    let tracking: PersonTrackingCoordinator
+    @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
     @State private var showCandidateDevices = true
     @State private var showCalibrationStartConfirmation = false
+
+    private var safetyArmed: Bool { bluetooth.motionSafetyArmed }
 
     var body: some View {
         ScrollView {
@@ -275,8 +436,16 @@ private struct ControlPanel: View {
                 Divider()
                 safetySection
                 calibrationSection
-                trackingSection
-                motionSection
+                TrackingSection(
+                    bluetooth: bluetooth,
+                    tracking: tracking,
+                    calibration: calibration
+                )
+                MotionSection(
+                    bluetooth: bluetooth,
+                    tracking: tracking,
+                    calibration: calibration
+                )
                 Divider()
                 logSection
             }
@@ -400,7 +569,12 @@ private struct ControlPanel: View {
 
     private var safetySection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Toggle(isOn: $safetyArmed) {
+            Toggle(
+                isOn: Binding(
+                    get: { bluetooth.motionSafetyArmed },
+                    set: { bluetooth.setMotionSafetyArmed($0) }
+                )
+            ) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("运动安全确认")
                         .font(.headline)
@@ -418,7 +592,12 @@ private struct ControlPanel: View {
                             || bluetooth.rangeCalibrationActive))
             )
 
-            Label("云台已回到安全居中起点，负载配平，软线有余量，周围无碰撞风险", systemImage: "checkmark.shield")
+            Label(
+                safetyChecklistText,
+                systemImage: safetyArmed && bluetooth.trackingOriginConfirmed
+                    ? "checkmark.shield.fill"
+                    : (safetyArmed ? "exclamationmark.shield" : "shield.slash")
+            )
                 .font(.caption)
                 .foregroundStyle(
                     safetyArmed && bluetooth.trackingOriginConfirmed
@@ -536,6 +715,12 @@ private struct ControlPanel: View {
                             calibration.confirmObservedStepAndContinue()
                         }
                         .buttonStyle(.borderedProminent)
+                    } else {
+                        Button("重试本步") {
+                            calibration.retryCurrentStep()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .help("场景恢复静止或干扰排除后，重新探测同一步")
                     }
 
                     Button(
@@ -613,7 +798,101 @@ private struct ControlPanel: View {
         }
     }
 
-    private var trackingSection: some View {
+
+    private var logSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Label("联调日志", systemImage: "terminal")
+                    .font(.headline)
+                Spacer()
+                Toggle(
+                    "逐包日志",
+                    isOn: Binding(
+                        get: { bluetooth.verboseLogging },
+                        set: { bluetooth.setVerboseLogging($0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .help("记录每个 BLE 分片的 TX/RX 十六进制内容；极速跟踪时会明显增加主线程负载")
+            }
+
+            ForEach(bluetooth.logs.prefix(12)) { entry in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(entry.timestamp, style: .time)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 58, alignment: .leading)
+                    Text(entry.message)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    private var safetyStatusText: String {
+        if !safetyArmed {
+            return "默认锁定；断线后自动复位"
+        }
+        if !bluetooth.trackingOriginConfirmed {
+            return "点动仍可用；人物跟踪前请回正并重新确认"
+        }
+        return "已解锁点动与全向安全行程验证"
+    }
+
+    private var safetyChecklistText: String {
+        if safetyArmed, bluetooth.trackingOriginConfirmed {
+            return "已确认：云台位于安全居中起点，负载配平，软线有余量，周围无碰撞风险"
+        }
+        if safetyArmed {
+            return "原点未确认：请人工回正后关闭并重新打开安全确认，再开始跟踪"
+        }
+        return "开启前请确认：云台回到居中起点，负载配平，软线有余量，周围无碰撞风险"
+    }
+
+    private var connectionWaitingText: String {
+        if bluetooth.state.isReady {
+            return "OM3 已验证连接；运动安全确认仍需手动开启。"
+        }
+        if bluetooth.automaticReconnectInProgress {
+            return "自动连接已启动；OM3 稍后开机也会自动接回。"
+        }
+        if bluetooth.state == .scanning {
+            return "让 OM3 开机并靠近 Mac mini…"
+        }
+        return "扫描后会在这里列出 BLE 设备"
+    }
+
+    private func calibrationDirectionSymbol(_ direction: GimbalCalibrationDirection) -> String {
+        switch direction {
+        case .left: return "arrow.left"
+        case .right: return "arrow.right"
+        case .up: return "arrow.up"
+        case .down: return "arrow.down"
+        }
+    }
+
+    private var confirmedDirectionButtonTitle: String {
+        guard let direction = calibration.currentDirection else {
+            return "确认实际移动，继续"
+        }
+        return "确认已\(direction.title)移动，继续"
+    }
+
+}
+
+/// The whole person-tracking control block. This is the main consumer of the
+/// vision-rate coordinator state, isolated so its updates stay off the rest of
+/// the control column.
+private struct TrackingSection: View {
+    @ObservedObject var bluetooth: OM3BluetoothController
+    @ObservedObject var tracking: PersonTrackingCoordinator
+    @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Toggle(
                 isOn: Binding(
@@ -634,6 +913,25 @@ private struct ControlPanel: View {
 
             if tracking.enabled {
                 personSelectionSection
+            }
+
+            if case let .motionPaused(reason) = tracking.state {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(reason, systemImage: "exclamationmark.octagon.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("结束本次跟踪") {
+                        tracking.setEnabled(false)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    Text("结束后请人工回正，再重新打开运动安全确认。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
             }
 
             if let detection = tracking.selectedPersonDetection, tracking.enabled {
@@ -744,7 +1042,7 @@ private struct ControlPanel: View {
                 }
             }
 
-            Text("首次识别默认锁定人物 1；点击其他人物编号可以立即切换。")
+            Text("首次识别默认锁定人物 1；点击预览中的人物框或下方编号可以立即切换。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
@@ -771,6 +1069,12 @@ private struct ControlPanel: View {
                             .tint(isSelected ? .green : .cyan)
                             .disabled(!tracking.canChangePersonSelection)
                             .accessibilityLabel(candidateAccessibilityLabel(candidate))
+                            .accessibilityAddTraits(isSelected ? .isSelected : [])
+                            .accessibilityHint(
+                                tracking.canChangePersonSelection
+                                    ? "点击后云台改为跟随该人物"
+                                    : "运动已暂停，当前不能切换人物"
+                            )
                         }
                     }
                 }
@@ -780,8 +1084,8 @@ private struct ControlPanel: View {
                !tracking.visiblePeople.contains(where: { $0.id == selected }) {
                 Label(
                     tracking.visiblePeople.isEmpty
-                        ? "\(selected.title) 已出框，正在搜索；重新出现后请手动点选"
-                        : "\(selected.title) 的可靠关联已中断；请从当前候选重新选择",
+                        ? "\(selected.title) 已出框，正在搜索；画面中只有一人时会自动重锁"
+                        : "\(selected.title) 的可靠关联已中断；可点选候选或等待单人自动重锁",
                     systemImage: "person.crop.circle.badge.questionmark"
                 )
                 .font(.caption2)
@@ -813,7 +1117,68 @@ private struct ControlPanel: View {
         }
     }
 
-    private var motionSection: some View {
+    private func signedPercent(_ value: Double) -> String {
+        String(format: "%+.0f%%", value * 100)
+    }
+
+    private var personCountText: String {
+        guard tracking.hasAnalyzedPeopleFrame else { return "正在分析人物…" }
+        return "检测到 \(tracking.visiblePeople.count) 个可跟踪人物"
+    }
+
+    private func candidateSummary(_ candidate: PersonCandidate) -> String {
+        "\(candidatePosition(candidate.detection.centerX)) · \(Int(candidate.detection.confidence * 100))%"
+    }
+
+    private func candidatePosition(_ centerX: Double) -> String {
+        if centerX < 0.38 { return "左侧" }
+        if centerX > 0.62 { return "右侧" }
+        return "中央"
+    }
+
+    private func candidateAccessibilityLabel(_ candidate: PersonCandidate) -> String {
+        let selection = candidate.id == tracking.selectedPersonID ? "已锁定" : "未锁定"
+        return "\(candidate.id.title)，画面\(candidatePosition(candidate.detection.centerX))，置信度 \(Int(candidate.detection.confidence * 100))%，\(selection)"
+    }
+
+    private var trackingHelpText: String {
+        if tracking.enabled, tracking.selectedPersonID == nil {
+            if !tracking.hasAnalyzedPeopleFrame {
+                return "正在分析摄像头画面；识别到人物后会默认锁定第一个候选。"
+            }
+            if tracking.visiblePeople.isEmpty {
+                return "当前没有检测到可跟踪人物，请让目标完整进入画面。"
+            }
+            return "请选择一个人物编号；未锁定前云台不会自动运动。"
+        }
+        if tracking.canResumeSearch {
+            return "人物分析仍在运行；确认线缆安全后可继续下一轮扫描。"
+        }
+        if tracking.enabled {
+            return "请让目标人物进入画面；出框后会自动惯性寻找并左右扫描。"
+        }
+        if bluetooth.motionSafetyArmed, !bluetooth.trackingOriginConfirmed {
+            return "当前原点已因点动或 STOP 失效；请人工回正，关闭并重新打开运动安全确认。"
+        }
+        return "需先启动摄像头、连接 OM3 并打开运动安全确认。"
+    }
+}
+
+private struct MotionSection: View {
+    @ObservedObject var bluetooth: OM3BluetoothController
+    @ObservedObject var tracking: PersonTrackingCoordinator
+    @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
+
+    private var canMove: Bool {
+        bluetooth.state.isReady
+            && bluetooth.motionSafetyArmed
+            && bluetooth.nudgeAvailable
+            && !tracking.enabled
+            && !calibration.isRunning
+            && !calibration.envelopeIsActive
+    }
+
+    var body: some View {
         VStack(spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
@@ -855,16 +1220,21 @@ private struct ControlPanel: View {
                     Button {
                         emergencyStop()
                     } label: {
-                        VStack(spacing: 4) {
+                        VStack(spacing: 2) {
                             Image(systemName: "stop.fill")
                             Text("STOP").font(.caption.weight(.bold))
+                            Text("空格").font(.caption2)
+                                .foregroundStyle(.white.opacity(0.75))
                         }
                         .frame(width: 88, height: 58)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
-                    .disabled(!bluetooth.state.isReady)
+                    // Deliberately never disabled: the emergency path must stay
+                    // reachable during connecting/reconnecting states, when a
+                    // previously commanded motion could still be running.
                     .keyboardShortcut(.space, modifiers: [])
+                    .help("紧急停止（空格键）；未连接时按下无副作用")
 
                     NudgeButton(title: "右转", symbol: "arrow.right", enabled: canMove) {
                         nudge(yaw: 5, pitch: 0, label: "右转 +5°")
@@ -878,62 +1248,8 @@ private struct ControlPanel: View {
         }
     }
 
-    private var logSection: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label("联调日志", systemImage: "terminal")
-                .font(.headline)
-
-            ForEach(bluetooth.logs.prefix(12)) { entry in
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(entry.timestamp, style: .time)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 58, alignment: .leading)
-                    Text(entry.message)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    Spacer(minLength: 0)
-                }
-            }
-        }
-    }
-
-    private var canMove: Bool {
-        bluetooth.state.isReady
-            && safetyArmed
-            && bluetooth.motionSafetyArmed
-            && bluetooth.nudgeAvailable
-            && !tracking.enabled
-            && !calibration.isRunning
-            && !calibration.envelopeIsActive
-    }
-
-    private var safetyStatusText: String {
-        if !safetyArmed {
-            return "默认锁定；断线后自动复位"
-        }
-        if !bluetooth.trackingOriginConfirmed {
-            return "点动仍可用；人物跟踪前请回正并重新确认"
-        }
-        return "已解锁点动与全向安全行程验证"
-    }
-
-    private var connectionWaitingText: String {
-        if bluetooth.state.isReady {
-            return "OM3 已验证连接；运动安全确认仍需手动开启。"
-        }
-        if bluetooth.automaticReconnectInProgress {
-            return "自动连接已启动；OM3 稍后开机也会自动接回。"
-        }
-        if bluetooth.state == .scanning {
-            return "让 OM3 开机并靠近 Mac mini…"
-        }
-        return "扫描后会在这里列出 BLE 设备"
-    }
-
     private func nudge(yaw: Int, pitch: Int, label: String) {
-        guard safetyArmed else { return }
+        guard bluetooth.motionSafetyArmed else { return }
         bluetooth.sendNudge(yawDegrees: yaw, pitchDegrees: pitch, label: label)
     }
 
@@ -943,71 +1259,6 @@ private struct ControlPanel: View {
         } else {
             tracking.emergencyStop()
         }
-    }
-
-    private func calibrationDirectionSymbol(_ direction: GimbalCalibrationDirection) -> String {
-        switch direction {
-        case .left: return "arrow.left"
-        case .right: return "arrow.right"
-        case .up: return "arrow.up"
-        case .down: return "arrow.down"
-        }
-    }
-
-    private var confirmedDirectionButtonTitle: String {
-        guard let direction = calibration.currentDirection else {
-            return "确认实际移动，继续"
-        }
-        return "确认已\(direction.title)移动，继续"
-    }
-
-    private func signedPercent(_ value: Double) -> String {
-        String(format: "%+.0f%%", value * 100)
-    }
-
-    private var personCountText: String {
-        guard tracking.hasAnalyzedPeopleFrame else { return "正在分析人物…" }
-        return "检测到 \(tracking.visiblePeople.count) 个可跟踪人物"
-    }
-
-    private func candidateSummary(_ candidate: PersonCandidate) -> String {
-        "\(candidatePosition(candidate.detection.centerX)) · \(Int(candidate.detection.confidence * 100))%"
-    }
-
-    private func candidatePosition(_ centerX: Double) -> String {
-        if centerX < 0.38 { return "左侧" }
-        if centerX > 0.62 { return "右侧" }
-        return "中央"
-    }
-
-    private func candidateAccessibilityLabel(_ candidate: PersonCandidate) -> String {
-        let selection = candidate.id == tracking.selectedPersonID ? "已锁定" : "未锁定"
-        return "\(candidate.id.title)，画面\(candidatePosition(candidate.detection.centerX))，置信度 \(Int(candidate.detection.confidence * 100))%，\(selection)"
-    }
-
-    private var trackingHelpText: String {
-        if tracking.enabled, tracking.selectedPersonID == nil {
-            if !tracking.hasAnalyzedPeopleFrame {
-                return "正在分析摄像头画面；识别到人物后会默认锁定第一个候选。"
-            }
-            if tracking.visiblePeople.isEmpty {
-                return "当前没有检测到可跟踪人物，请让目标完整进入画面。"
-            }
-            return "请选择一个人物编号；未锁定前云台不会自动运动。"
-        }
-        if tracking.canResumeSearch {
-            return "人物分析仍在运行；确认线缆安全后可继续下一轮扫描。"
-        }
-        if case .motionPaused = tracking.state {
-            return "人物分析仍在运行，但运动已因硬安全边界暂停。"
-        }
-        if tracking.enabled {
-            return "请让目标人物进入画面；出框后会自动惯性寻找并左右扫描。"
-        }
-        if safetyArmed, !bluetooth.trackingOriginConfirmed {
-            return "当前原点已因点动或 STOP 失效；请人工回正，关闭并重新打开运动安全确认。"
-        }
-        return "需先启动摄像头、连接 OM3 并打开运动安全确认。"
     }
 }
 

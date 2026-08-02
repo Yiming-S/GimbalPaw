@@ -74,21 +74,37 @@ final class PersonTrackingCoordinator: ObservableObject {
     private static let reacquisitionMaximumCenterShift = 0.05
 
     @Published private(set) var enabled = false
-    @Published private(set) var state: PersonTrackingState = .off
     @Published private(set) var canEnable = false
-    @Published private(set) var canResumeSearch = false
     @Published private(set) var speedMode: PersonTrackingSpeedMode = .fast
-    @Published private(set) var visiblePeople: [PersonCandidate] = []
-    @Published private(set) var selectedPersonID: PersonCandidateID?
-    @Published private(set) var selectedPersonDetection: PersonDetection?
-    @Published private(set) var hasAnalyzedPeopleFrame = false
+
+    // These change on the ~12.5 Hz vision cadence, and @Published fires
+    // objectWillChange on every assignment even when the value is identical.
+    // Manual willSet publication only wakes observers on real changes.
+    private(set) var state: PersonTrackingState = .off {
+        willSet { if newValue != state { objectWillChange.send() } }
+    }
+    private(set) var canResumeSearch = false {
+        willSet { if newValue != canResumeSearch { objectWillChange.send() } }
+    }
+    private(set) var visiblePeople: [PersonCandidate] = [] {
+        willSet { if newValue != visiblePeople { objectWillChange.send() } }
+    }
+    private(set) var selectedPersonID: PersonCandidateID? {
+        willSet { if newValue != selectedPersonID { objectWillChange.send() } }
+    }
+    private(set) var selectedPersonDetection: PersonDetection? {
+        willSet { if newValue != selectedPersonDetection { objectWillChange.send() } }
+    }
+    private(set) var hasAnalyzedPeopleFrame = false {
+        willSet { if newValue != hasAnalyzedPeopleFrame { objectWillChange.send() } }
+    }
 
     var canChangePersonSelection: Bool {
         enabled && phase != .motionPaused
     }
 
-    private let bluetooth: OM3BluetoothController
-    private let camera: CameraController
+    private let bluetooth: any PersonTrackingBluetoothControlling
+    private let camera: any PersonTrackingCameraControlling
     private var cancellables: Set<AnyCancellable> = []
     private var watchdogTask: Task<Void, Never>?
     private var pendingCorrectionRetryTask: Task<Void, Never>?
@@ -119,11 +135,15 @@ final class PersonTrackingCoordinator: ObservableObject {
     private var searchEpisodeTravelTenths = 0
     private var searchBoundaryTouches = 0
     private var resumeSearchAfterCandidate = false
+    private var reacquisitionCandidateID: PersonCandidateID?
     private var identityTracker = PersonIdentityTracker()
     private var smoothedSelectedDetection: PersonDetection?
     private var hasMadeInitialAutomaticSelection = false
 
-    init(bluetooth: OM3BluetoothController, camera: CameraController) {
+    init(
+        bluetooth: any PersonTrackingBluetoothControlling,
+        camera: any PersonTrackingCameraControlling
+    ) {
         self.bluetooth = bluetooth
         self.camera = camera
         let defaults = UserDefaults.standard
@@ -135,7 +155,7 @@ final class PersonTrackingCoordinator: ObservableObject {
             speedMode = .fast
         }
 
-        bluetooth.$state
+        bluetooth.statePublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] state in
                 guard let self else { return }
@@ -146,17 +166,17 @@ final class PersonTrackingCoordinator: ObservableObject {
             }
             .store(in: &cancellables)
 
-        bluetooth.$nudgeAvailable
+        bluetooth.nudgeAvailablePublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.recomputeAvailability() }
             .store(in: &cancellables)
 
-        bluetooth.$trackingOriginConfirmed
+        bluetooth.trackingOriginConfirmedPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.recomputeAvailability() }
             .store(in: &cancellables)
 
-        bluetooth.$personTrackingActive
+        bluetooth.personTrackingActivePublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] active in
                 guard let self else { return }
@@ -173,7 +193,7 @@ final class PersonTrackingCoordinator: ObservableObject {
             }
             .store(in: &cancellables)
 
-        camera.$status
+        camera.statusPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] status in
                 guard let self else { return }
@@ -184,13 +204,11 @@ final class PersonTrackingCoordinator: ObservableObject {
             }
             .store(in: &cancellables)
 
-        camera.$personSample
-            .receive(on: RunLoop.main)
-            .sink { [weak self] sample in
-                guard let self, let sample else { return }
-                self.consume(sample)
-            }
-            .store(in: &cancellables)
+        // Samples arrive as a direct main-thread callback: no Combine hop, no
+        // run-loop-mode stalls, and no whole-object invalidation per frame.
+        camera.onPersonSample = { [weak self] sample in
+            self?.consume(sample)
+        }
     }
 
     deinit {
@@ -298,6 +316,14 @@ final class PersonTrackingCoordinator: ObservableObject {
         phase = .awaitingSelection
         state = .awaitingSelection(0)
         camera.setPersonTrackingEnabled(true)
+        // The camera can refuse (e.g. motion calibration still holds the
+        // analyzer). Without this check the UI would report tracking as on
+        // while no sample ever arrives.
+        guard camera.personTrackingEnabled else {
+            disable(reason: "摄像头人物分析未能启动", sendStop: false)
+            state = .unavailable("摄像头人物分析未能启动；请先结束全向验证或重启预览")
+            return
+        }
         startWatchdog()
         recomputeAvailability()
     }
@@ -337,11 +363,22 @@ final class PersonTrackingCoordinator: ObservableObject {
         activeVisionSessionID = sample.sessionID
 
         let now = ProcessInfo.processInfo.systemUptime
+        // A sample that is too old to steer motion still proves the vision
+        // pipeline is alive. Recording it before the freshness gate keeps the
+        // scan stall detector from treating flowing-but-late frames as a
+        // frozen camera and pausing every search episode at its first step.
+        lastVisionSampleAtUptime = sample.observedAtUptime
+        hasAnalyzedPeopleFrame = true
         guard now - sample.observedAtUptime <= sessionSpeedMode.maximumSampleAge else {
             return
         }
-        lastVisionSampleAtUptime = sample.observedAtUptime
-        hasAnalyzedPeopleFrame = true
+
+        // Tracker samples are position-only updates for the locked target;
+        // identity, acquisition, and loss handling stay detector-driven.
+        if sample.origin == .tracker {
+            consumeTrackerSample(sample)
+            return
+        }
 
         var snapshot = identityTracker.update(
             detections: sample.detections,
@@ -366,6 +403,10 @@ final class PersonTrackingCoordinator: ObservableObject {
         }
 
         guard let rawDetection = snapshot.lockedDetection else {
+            if identityTracker.hasUnresolvedRetiredLock,
+               handleCandidateObservation(snapshot: snapshot, sample: sample) {
+                return
+            }
             let targetSample = PersonVisionSample(
                 sessionID: sample.sessionID,
                 detection: nil,
@@ -378,6 +419,10 @@ final class PersonTrackingCoordinator: ObservableObject {
 
         let detection = smoothSelectedDetection(rawDetection)
         selectedPersonDetection = detection
+        // Every detector-confirmed position re-anchors the correlation
+        // tracker, so its intermediate updates cannot drift for more than one
+        // detector period.
+        camera.setPersonTrackingSeed(rawDetection)
         let targetSample = PersonVisionSample(
             sessionID: sample.sessionID,
             detections: sample.detections,
@@ -386,6 +431,33 @@ final class PersonTrackingCoordinator: ObservableObject {
             observedAtUptime: sample.observedAtUptime
         )
         handleValidObservation(detection, sample: targetSample)
+    }
+
+    /// Full-frame-rate position updates from the correlation tracker. Only
+    /// steers the gimbal while the phase is already following and the detector
+    /// confirmed the locked person within the bridge window; it never touches
+    /// miss counters, loss timing, or identity state.
+    private func consumeTrackerSample(_ sample: PersonVisionSample) {
+        guard phase == .following,
+              identityTracker.lockedID != nil,
+              !identityTracker.hasUnresolvedRetiredLock,
+              let rawDetection = sample.detections.first,
+              lastValidAtUptime > 0,
+              sample.observedAtUptime - lastValidAtUptime
+                <= PersonTrackingPolicy.trackerBridgeMaximumGap
+        else { return }
+
+        let detection = smoothSelectedDetection(rawDetection)
+        selectedPersonDetection = detection
+        let targetSample = PersonVisionSample(
+            sessionID: sample.sessionID,
+            detections: sample.detections,
+            selectedDetection: detection,
+            sequence: sample.sequence,
+            observedAtUptime: sample.observedAtUptime,
+            origin: .tracker
+        )
+        processFollowingDetection(detection, sample: targetSample, isTrackerDriven: true)
     }
 
     private func handleMissingObservation(_ sample: PersonVisionSample) {
@@ -443,10 +515,18 @@ final class PersonTrackingCoordinator: ObservableObject {
 
         switch phase {
         case .coasting, .searching:
-            beginReacquisition(with: sample, resumeSearchIfRejected: true)
+            beginReacquisition(
+                with: sample,
+                resumeSearchIfRejected: true,
+                candidateID: identityTracker.lockedID
+            )
             return
         case .searchPaused:
-            beginReacquisition(with: sample, resumeSearchIfRejected: false)
+            beginReacquisition(
+                with: sample,
+                resumeSearchIfRejected: false,
+                candidateID: identityTracker.lockedID
+            )
             return
         case .awaitingSelection, .motionPaused, .off:
             return
@@ -459,12 +539,101 @@ final class PersonTrackingCoordinator: ObservableObject {
             return
         case .following, .lossGrace:
             if validObservationGap >= PersonTrackingPolicy.lostTimeout {
-                beginReacquisition(with: sample, resumeSearchIfRejected: true)
+                beginReacquisition(
+                    with: sample,
+                    resumeSearchIfRejected: true,
+                    candidateID: identityTracker.lockedID
+                )
                 return
             }
             phase = .following
             processFollowingDetection(detection, sample: sample)
         }
+    }
+
+    /// Handles frames whose explicit lock can no longer be resolved while other
+    /// candidates are visible. Policy: exactly one visible candidate is
+    /// stabilized and then inherits the lock automatically; several visible
+    /// candidates always stop automatic motion and wait for a manual choice.
+    /// Returns false when the frame should fall through to the missing-target
+    /// handling instead.
+    private func handleCandidateObservation(
+        snapshot: PersonIdentitySnapshot,
+        sample: PersonVisionSample
+    ) -> Bool {
+        let candidates = snapshot.visibleCandidates
+        guard !candidates.isEmpty else { return false }
+        let onlyCandidate = candidates.count == 1 ? candidates[0] : nil
+
+        switch phase {
+        case .lossGrace, .coasting, .searching:
+            if let onlyCandidate {
+                beginReacquisition(
+                    with: sample,
+                    resumeSearchIfRejected: true,
+                    candidateID: onlyCandidate.id
+                )
+            } else {
+                pauseForManualSelection()
+            }
+            return true
+
+        case .searchPaused:
+            // Multiple candidates keep the pause as-is: the person buttons are
+            // already visible and re-issuing a STOP every frame is pointless.
+            guard let onlyCandidate else { return true }
+            beginReacquisition(
+                with: sample,
+                resumeSearchIfRejected: false,
+                candidateID: onlyCandidate.id
+            )
+            return true
+
+        case let .reacquiring(settleUntilUptime):
+            guard let onlyCandidate else {
+                resetAcquisitionCounters()
+                pauseForManualSelection()
+                return true
+            }
+            if reacquisitionCandidateID != onlyCandidate.id {
+                resetAcquisitionCounters()
+                reacquisitionCandidateID = onlyCandidate.id
+            }
+            guard sample.observedAtUptime >= settleUntilUptime else { return true }
+            processAcquisition(
+                onlyCandidate.detection,
+                sample: sample,
+                isReacquisition: true
+            )
+            return true
+
+        case .acquiring:
+            // Nothing is moving during acquisition, so a retired lock can be
+            // transferred in place; with several people visible the user must
+            // choose again.
+            if let onlyCandidate {
+                if identityTracker.lock(on: onlyCandidate.id) {
+                    resetAcquisitionCounters()
+                    publishIdentitySnapshot(identityTracker.currentSnapshot)
+                }
+            } else {
+                identityTracker.clearLock()
+                publishIdentitySnapshot(identityTracker.currentSnapshot)
+                phase = .awaitingSelection
+                state = .awaitingSelection(candidates.count)
+            }
+            return true
+
+        case .following, .awaitingSelection, .motionPaused, .off:
+            return false
+        }
+    }
+
+    private func pauseForManualSelection() {
+        pauseAutomaticMotion(
+            reason: "检测到多名人物，请点选跟踪目标",
+            resumable: true
+        )
     }
 
     private func processAcquisition(
@@ -513,6 +682,16 @@ final class PersonTrackingCoordinator: ObservableObject {
               sample.observedAtUptime - acquisitionStartedAtUptime >= requiredDuration
         else { return }
 
+        if isReacquisition,
+           let candidateID = reacquisitionCandidateID,
+           identityTracker.lockedID != candidateID {
+            guard identityTracker.lock(on: candidateID) else {
+                resetAcquisitionCounters()
+                return
+            }
+            publishIdentitySnapshot(identityTracker.currentSnapshot)
+        }
+        reacquisitionCandidateID = nil
         phase = .following
         canResumeSearch = false
         resumeSearchAfterCandidate = false
@@ -530,13 +709,19 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func processFollowingDetection(
         _ detection: PersonDetection,
-        sample: PersonVisionSample
+        sample: PersonVisionSample,
+        isTrackerDriven: Bool = false
     ) {
         guard let sessionID, let sessionSpeedMode = activeSpeedMode else { return }
         phase = .following
-        consecutiveMisses = 0
-        lastValidAtUptime = sample.observedAtUptime
-        recordHorizontalObservation(detection)
+        if !isTrackerDriven {
+            // Loss handling and coast-direction inference stay on the
+            // detector cadence; tracker samples must not extend the perceived
+            // validity of the target.
+            consecutiveMisses = 0
+            lastValidAtUptime = sample.observedAtUptime
+            recordHorizontalObservation(detection)
+        }
 
         guard let correction = PersonTrackingPolicy.correction(
             for: detection,
@@ -957,7 +1142,8 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func beginReacquisition(
         with sample: PersonVisionSample,
-        resumeSearchIfRejected: Bool
+        resumeSearchIfRejected: Bool,
+        candidateID: PersonCandidateID?
     ) {
         guard let sessionID else { return }
         _ = beginNewMotionGeneration()
@@ -969,6 +1155,7 @@ final class PersonTrackingCoordinator: ObservableObject {
         state = .reacquiring
         canResumeSearch = false
         resetAcquisitionCounters()
+        reacquisitionCandidateID = candidateID
         lastValidAtUptime = sample.observedAtUptime
         recentHorizontalObservations.removeAll(keepingCapacity: true)
         lastSubmittedCorrection = nil
@@ -1076,6 +1263,7 @@ final class PersonTrackingCoordinator: ObservableObject {
         consecutiveValidDetections = 0
         acquisitionStartedAtUptime = nil
         lastAcquisitionDetection = nil
+        reacquisitionCandidateID = nil
     }
 
     private func publishIdentitySnapshot(_ snapshot: PersonIdentitySnapshot) {
@@ -1102,6 +1290,7 @@ final class PersonTrackingCoordinator: ObservableObject {
     }
 
     private func prepareForTargetSelection() {
+        camera.setPersonTrackingSeed(nil)
         phase = .acquiring
         state = .acquiring
         canResumeSearch = false
@@ -1141,6 +1330,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func resetTargetState() {
         _ = beginNewMotionGeneration()
+        camera.setPersonTrackingSeed(nil)
         identityTracker.reset()
         phase = .off
         activeVisionSessionID = nil
@@ -1194,6 +1384,7 @@ final class PersonTrackingCoordinator: ObservableObject {
             && bluetooth.state.isReady
             && bluetooth.nudgeAvailable
             && camera.status.isRunning
+            && !camera.motionCalibrationEnabled
             && !enabled
     }
 }
