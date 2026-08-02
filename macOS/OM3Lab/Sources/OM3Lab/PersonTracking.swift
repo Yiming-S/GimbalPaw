@@ -452,6 +452,106 @@ struct PersonTrackingCorrection: Equatable, Sendable {
     var isZero: Bool { yawTenths == 0 && pitchTenths == 0 }
 }
 
+/// One Euro filter (Casiez, Roussel, Vogel 2012): a low-pass filter whose
+/// cutoff rises with the signal's speed. Slow targets get heavy smoothing so
+/// detector jitter never reaches the gimbal; fast targets get light smoothing
+/// so filtering does not add visible lag. Its smoothed derivative doubles as
+/// the velocity estimate used for predictive aiming.
+struct OneEuroFilter: Equatable, Sendable {
+    let minimumCutoff: Double
+    let beta: Double
+    let derivativeCutoff: Double
+
+    private(set) var value: Double?
+    private(set) var velocity: Double = 0
+    private var lastRaw: Double?
+    private var lastTime: TimeInterval?
+
+    init(minimumCutoff: Double, beta: Double, derivativeCutoff: Double) {
+        self.minimumCutoff = minimumCutoff
+        self.beta = beta
+        self.derivativeCutoff = derivativeCutoff
+    }
+
+    @discardableResult
+    mutating func filter(_ raw: Double, at time: TimeInterval) -> Double {
+        guard let previousValue = value,
+              let previousRaw = lastRaw,
+              let previousTime = lastTime,
+              time > previousTime
+        else {
+            value = raw
+            velocity = 0
+            lastRaw = raw
+            lastTime = time
+            return raw
+        }
+        let interval = time - previousTime
+        // The derivative is taken on the raw signal, not on the filtered
+        // estimate as in the canonical formulation: this velocity also feeds
+        // the predictive aim, where the catch-up bias of the filtered-value
+        // difference would systematically overshoot on a moving target.
+        let rawVelocity = (raw - previousRaw) / interval
+        let velocityAlpha = Self.smoothingFactor(
+            cutoff: derivativeCutoff,
+            interval: interval
+        )
+        velocity += velocityAlpha * (rawVelocity - velocity)
+        let cutoff = minimumCutoff + beta * abs(velocity)
+        let alpha = Self.smoothingFactor(cutoff: cutoff, interval: interval)
+        let filtered = previousValue + alpha * (raw - previousValue)
+        value = filtered
+        lastRaw = raw
+        lastTime = time
+        return filtered
+    }
+
+    mutating func reset() {
+        value = nil
+        velocity = 0
+        lastRaw = nil
+        lastTime = nil
+    }
+
+    private static func smoothingFactor(
+        cutoff: Double,
+        interval: TimeInterval
+    ) -> Double {
+        let timeConstant = 1.0 / (2.0 * Double.pi * max(cutoff, 0.000_001))
+        return 1.0 / (1.0 + timeConstant / interval)
+    }
+}
+
+/// Per-axis dead-zone hysteresis state. An axis leaves the centered regime
+/// only past the outer dead zone and re-enters it only inside the smaller
+/// inner zone, so a target hovering at the boundary cannot toggle the gimbal
+/// between correcting and stopping.
+struct PersonTrackingCenteringState: Equatable, Sendable {
+    var yawCentered: Bool
+    var pitchCentered: Bool
+
+    static let uncentered = PersonTrackingCenteringState(
+        yawCentered: false,
+        pitchCentered: false
+    )
+    static let centered = PersonTrackingCenteringState(
+        yawCentered: true,
+        pitchCentered: true
+    )
+
+    var isFullyCentered: Bool { yawCentered && pitchCentered }
+}
+
+/// The outcome of one control cycle. `correction == nil` means either both
+/// axes are centered (check `centering`) or a minor direction reversal was
+/// absorbed for one cycle; `requiresReversalStop` requests the full
+/// STOP-and-pause path for a significant reversal.
+struct PersonTrackingControlDecision: Equatable, Sendable {
+    let correction: PersonTrackingCorrection?
+    let centering: PersonTrackingCenteringState
+    let requiresReversalStop: Bool
+}
+
 /// A four-direction travel envelope measured relative to the pose where tracking
 /// starts. Calibration verifies the four cardinal directions, not every diagonal,
 /// so the usable two-axis region is their conservative diamond rather than the
@@ -721,10 +821,13 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var smallStepTenths: Int {
+    /// The floor of the proportional ramp at the dead-zone edge. Kept small so
+    /// a target barely outside the dead zone gets a gentle nudge rather than a
+    /// visible kick.
+    var minimumStepTenths: Int {
         switch self {
-        case .smooth, .standard: return 5
-        case .fast: return 15
+        case .smooth, .standard: return 3
+        case .fast: return 5
         }
     }
 
@@ -773,9 +876,27 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
 enum PersonTrackingPolicy {
     static let horizontalDeadZone = 0.12
     static let verticalDeadZone = 0.15
-    /// The vertical framing target sits slightly above the geometric center so
-    /// a tracked person keeps head-room instead of being pinned to the middle.
-    static let verticalCompositionTarget = 0.42
+    /// Inner (re-entry) dead zones for the hysteresis: once correcting, an
+    /// axis keeps correcting until the error falls inside these.
+    static let horizontalInnerDeadZone = 0.07
+    static let verticalInnerDeadZone = 0.09
+    /// Vertical control anchors on the head — a quarter of the way down the
+    /// upper-body box — because the box center jumps when arms raise or the
+    /// posture changes. Target 0.32 plus the anchor offset reproduces the
+    /// previous head-room framing (box center ≈ 0.42) for a typical box.
+    static let headAnchorFraction = 0.25
+    static let verticalHeadAnchorTarget = 0.32
+    /// Predictive aiming: corrections target where the person will be after
+    /// roughly the pipeline latency plus one command duration, with the lead
+    /// clamped so a noisy velocity estimate cannot fling the aim point.
+    static let predictionHorizon: TimeInterval = 0.18
+    static let maximumPredictionLead = 0.12
+    /// A correction's magnitude may grow at most this much between consecutive
+    /// commands (per axis); decreasing toward zero is never limited.
+    static let slewLimitTenths = 20
+    /// Axis reversals at or above this magnitude take the full STOP-and-pause
+    /// path; smaller ones are absorbed by zeroing the axis for one cycle.
+    static let significantReversalTenths = 10
     static let analysisInterval: TimeInterval = 0.08
     static let acquisitionMinimumDuration: TimeInterval = 0.24
     static let reversalPauseDuration: TimeInterval = 0.18
@@ -879,33 +1000,93 @@ enum PersonTrackingPolicy {
         return bounded
     }
 
+    static func headAnchorY(for detection: PersonDetection) -> Double {
+        detection.y + headAnchorFraction * detection.height
+    }
+
+    /// Single-shot compatibility entry point: no velocity, no history. Starts
+    /// from the centered regime so the classic outer dead zone applies.
     static func correction(
         for detection: PersonDetection,
         speedMode: PersonTrackingSpeedMode = .fast
     ) -> PersonTrackingCorrection? {
-        let horizontalError = detection.centerX - 0.5
-        let verticalError = detection.centerY - verticalCompositionTarget
+        predictiveCorrection(
+            anchorX: detection.centerX,
+            anchorY: headAnchorY(for: detection),
+            velocityX: 0,
+            velocityY: 0,
+            centering: .centered,
+            previousCorrection: nil,
+            speedMode: speedMode
+        ).correction
+    }
 
-        let yaw = signedStep(
+    /// One full control cycle: predictive aiming, hysteresis dead zones,
+    /// per-axis reversal handling, slew limiting, then the combined-magnitude
+    /// cap. Pure so the whole smoothness profile stays unit-testable.
+    static func predictiveCorrection(
+        anchorX: Double,
+        anchorY: Double,
+        velocityX: Double,
+        velocityY: Double,
+        centering: PersonTrackingCenteringState,
+        previousCorrection: PersonTrackingCorrection?,
+        speedMode: PersonTrackingSpeedMode
+    ) -> PersonTrackingControlDecision {
+        let horizontalError = predictedCoordinate(anchorX, velocity: velocityX) - 0.5
+        // Coordinates use a top-left origin: a negative error means the person
+        // is above the target. The calibrated OM3 mapping uses negative pitch
+        // for up.
+        let verticalError = predictedCoordinate(anchorY, velocity: velocityY)
+            - verticalHeadAnchorTarget
+
+        let yawStep = axisStep(
             error: horizontalError,
-            deadZone: horizontalDeadZone,
+            wasCentered: centering.yawCentered,
+            innerDeadZone: horizontalInnerDeadZone,
+            outerDeadZone: horizontalDeadZone,
             mediumThreshold: 0.22,
             largeThreshold: 0.34,
-            smallTenths: speedMode.smallStepTenths,
+            minimumTenths: speedMode.minimumStepTenths,
             mediumTenths: speedMode.mediumStepTenths,
             maximumTenths: speedMode.yawMaximumTenths
         )
-        // Coordinates use a top-left origin: a negative error means the person is
-        // above center. The calibrated OM3 mapping uses negative pitch for up.
-        let pitch = signedStep(
+        let pitchStep = axisStep(
             error: verticalError,
-            deadZone: verticalDeadZone,
+            wasCentered: centering.pitchCentered,
+            innerDeadZone: verticalInnerDeadZone,
+            outerDeadZone: verticalDeadZone,
             mediumThreshold: 0.25,
             largeThreshold: 0.38,
-            smallTenths: speedMode.smallStepTenths,
+            minimumTenths: speedMode.minimumStepTenths,
             mediumTenths: speedMode.mediumStepTenths,
             maximumTenths: speedMode.pitchMaximumTenths
         )
+        var yaw = yawStep.tenths
+        var pitch = pitchStep.tenths
+        let newCentering = PersonTrackingCenteringState(
+            yawCentered: yawStep.isCentered,
+            pitchCentered: pitchStep.isCentered
+        )
+
+        if let previous = previousCorrection {
+            let yawReverses = reverses(yaw, against: previous.yawTenths)
+            let pitchReverses = reverses(pitch, against: previous.pitchTenths)
+            if (yawReverses && abs(yaw) >= significantReversalTenths)
+                || (pitchReverses && abs(pitch) >= significantReversalTenths) {
+                return PersonTrackingControlDecision(
+                    correction: nil,
+                    centering: newCentering,
+                    requiresReversalStop: true
+                )
+            }
+            // A minor reversal is absorbed by holding that axis for one cycle:
+            // the previous burst decays inside the OM3 without a hard STOP.
+            if yawReverses { yaw = 0 }
+            if pitchReverses { pitch = 0 }
+            yaw = slewLimited(yaw, previous: previous.yawTenths)
+            pitch = slewLimited(pitch, previous: previous.pitchTenths)
+        }
 
         let limited = limitCombinedMagnitude(
             yaw: yaw,
@@ -916,7 +1097,34 @@ enum PersonTrackingPolicy {
             yawTenths: limited.yaw,
             pitchTenths: limited.pitch
         )
-        return correction.isZero ? nil : correction
+        return PersonTrackingControlDecision(
+            correction: correction.isZero ? nil : correction,
+            centering: newCentering,
+            requiresReversalStop: false
+        )
+    }
+
+    private static func predictedCoordinate(
+        _ position: Double,
+        velocity: Double
+    ) -> Double {
+        let lead = min(
+            maximumPredictionLead,
+            max(-maximumPredictionLead, velocity * predictionHorizon)
+        )
+        return min(1, max(0, position + lead))
+    }
+
+    private static func reverses(_ next: Int, against previous: Int) -> Bool {
+        next != 0 && previous != 0 && (next < 0) != (previous < 0)
+    }
+
+    /// Only magnitude growth is limited; decaying toward zero must always be
+    /// allowed so the gimbal can stop within one cycle.
+    private static func slewLimited(_ next: Int, previous: Int) -> Int {
+        let allowedMagnitude = abs(previous) + slewLimitTenths
+        guard abs(next) > allowedMagnitude else { return next }
+        return next < 0 ? -allowedMagnitude : allowedMagnitude
     }
 
     private static func limitCombinedMagnitude(
@@ -975,24 +1183,32 @@ enum PersonTrackingPolicy {
             + abs(pitchTenths) / Double(pitchLimit)
     }
 
-    private static func signedStep(
+    private static func axisStep(
         error: Double,
-        deadZone: Double,
+        wasCentered: Bool,
+        innerDeadZone: Double,
+        outerDeadZone: Double,
         mediumThreshold: Double,
         largeThreshold: Double,
-        smallTenths: Int,
+        minimumTenths: Int,
         mediumTenths: Int,
         maximumTenths: Int
-    ) -> Int {
+    ) -> (tenths: Int, isCentered: Bool) {
         let magnitude = abs(error)
-        guard magnitude > deadZone else { return 0 }
+        // Hysteresis: leaving the centered regime needs the outer dead zone;
+        // returning to it needs the inner one.
+        if wasCentered {
+            guard magnitude > outerDeadZone else { return (0, true) }
+        } else if magnitude <= innerDeadZone {
+            return (0, true)
+        }
 
-        let small = min(smallTenths, maximumTenths)
+        let minimum = min(minimumTenths, maximumTenths)
         let medium = min(mediumTenths, maximumTenths)
-        // Piecewise-linear through the tuned waypoints instead of three flat
-        // plateaus: corrections scale continuously with the framing error, so
-        // motion no longer visibly jumps between step sizes or oscillates
-        // when the error hovers around a plateau boundary.
+        // Piecewise-linear through the tuned waypoints instead of flat
+        // plateaus: corrections scale continuously with the framing error.
+        // Inside the hysteresis band (between the inner and outer dead zones)
+        // only the minimum nudge applies.
         let step: Double
         if magnitude >= largeThreshold {
             step = Double(maximumTenths)
@@ -1000,12 +1216,14 @@ enum PersonTrackingPolicy {
             let ramp = (magnitude - mediumThreshold)
                 / max(largeThreshold - mediumThreshold, 0.000_001)
             step = Double(medium) + ramp * Double(maximumTenths - medium)
+        } else if magnitude > outerDeadZone {
+            let ramp = (magnitude - outerDeadZone)
+                / max(mediumThreshold - outerDeadZone, 0.000_001)
+            step = Double(minimum) + ramp * Double(medium - minimum)
         } else {
-            let ramp = (magnitude - deadZone)
-                / max(mediumThreshold - deadZone, 0.000_001)
-            step = Double(small) + ramp * Double(medium - small)
+            step = Double(minimum)
         }
         let rounded = max(1, Int(step.rounded()))
-        return error < 0 ? -rounded : rounded
+        return (error < 0 ? -rounded : rounded, false)
     }
 }

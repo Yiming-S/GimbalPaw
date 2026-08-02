@@ -139,6 +139,20 @@ final class PersonTrackingCoordinator: ObservableObject {
     private var identityTracker = PersonIdentityTracker()
     private var smoothedSelectedDetection: PersonDetection?
     private var hasMadeInitialAutomaticSelection = false
+    // Control-path filtering is separate from the display smoothing above:
+    // One Euro filters on the control anchor give low-lag jitter rejection and
+    // a velocity estimate for predictive aiming.
+    private var controlFilterX = OneEuroFilter(
+        minimumCutoff: 1.2,
+        beta: 0.4,
+        derivativeCutoff: 1.0
+    )
+    private var controlFilterY = OneEuroFilter(
+        minimumCutoff: 1.2,
+        beta: 0.4,
+        derivativeCutoff: 1.0
+    )
+    private var centeringState = PersonTrackingCenteringState.uncentered
 
     init(
         bluetooth: any PersonTrackingBluetoothControlling,
@@ -419,6 +433,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
         let detection = smoothSelectedDetection(rawDetection)
         selectedPersonDetection = detection
+        updateControlFilters(with: rawDetection, at: sample.observedAtUptime)
         // Every detector-confirmed position re-anchors the correlation
         // tracker, so its intermediate updates cannot drift for more than one
         // detector period.
@@ -449,6 +464,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
         let detection = smoothSelectedDetection(rawDetection)
         selectedPersonDetection = detection
+        updateControlFilters(with: rawDetection, at: sample.observedAtUptime)
         let targetSample = PersonVisionSample(
             sessionID: sample.sessionID,
             detections: sample.detections,
@@ -458,6 +474,23 @@ final class PersonTrackingCoordinator: ObservableObject {
             origin: .tracker
         )
         processFollowingDetection(detection, sample: targetSample, isTrackerDriven: true)
+    }
+
+    private func updateControlFilters(
+        with rawDetection: PersonDetection,
+        at observedAtUptime: TimeInterval
+    ) {
+        controlFilterX.filter(rawDetection.centerX, at: observedAtUptime)
+        controlFilterY.filter(
+            PersonTrackingPolicy.headAnchorY(for: rawDetection),
+            at: observedAtUptime
+        )
+    }
+
+    private func resetControlFilters() {
+        controlFilterX.reset()
+        controlFilterY.reset()
+        centeringState = .uncentered
     }
 
     private func handleMissingObservation(_ sample: PersonVisionSample) {
@@ -598,7 +631,12 @@ final class PersonTrackingCoordinator: ObservableObject {
             if reacquisitionCandidateID != onlyCandidate.id {
                 resetAcquisitionCounters()
                 reacquisitionCandidateID = onlyCandidate.id
+                resetControlFilters()
             }
+            updateControlFilters(
+                with: onlyCandidate.detection,
+                at: sample.observedAtUptime
+            )
             guard sample.observedAtUptime >= settleUntilUptime else { return true }
             processAcquisition(
                 onlyCandidate.detection,
@@ -614,6 +652,7 @@ final class PersonTrackingCoordinator: ObservableObject {
             if let onlyCandidate {
                 if identityTracker.lock(on: onlyCandidate.id) {
                     resetAcquisitionCounters()
+                    resetControlFilters()
                     publishIdentitySnapshot(identityTracker.currentSnapshot)
                 }
             } else {
@@ -723,24 +762,25 @@ final class PersonTrackingCoordinator: ObservableObject {
             recordHorizontalObservation(detection)
         }
 
-        guard let correction = PersonTrackingPolicy.correction(
-            for: detection,
-            speedMode: sessionSpeedMode
-        ) else {
-            pendingCorrectionRetryTask?.cancel()
-            pendingCorrectionRetryTask = nil
-            stopSupersededVisualMotionIfNeeded(reason: "人物进入中心死区 STOP")
-            state = .centered
-            return
-        }
-
         let now = ProcessInfo.processInfo.systemUptime
         guard now >= reversalBlockedUntilUptime else {
             state = .locked
             return
         }
-        if let previous = lastSubmittedCorrection,
-           reversesDirection(correction, comparedWith: previous) {
+
+        let decision = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: controlFilterX.value ?? detection.centerX,
+            anchorY: controlFilterY.value
+                ?? PersonTrackingPolicy.headAnchorY(for: detection),
+            velocityX: controlFilterX.velocity,
+            velocityY: controlFilterY.velocity,
+            centering: centeringState,
+            previousCorrection: lastSubmittedCorrection,
+            speedMode: sessionSpeedMode
+        )
+        centeringState = decision.centering
+
+        if decision.requiresReversalStop {
             reversalBlockedUntilUptime = now + PersonTrackingPolicy.reversalPauseDuration
             _ = beginNewMotionGeneration()
             bluetooth.pausePersonTrackingWithStop(
@@ -750,6 +790,19 @@ final class PersonTrackingCoordinator: ObservableObject {
             centerStopIssued = true
             lastSubmittedCorrection = nil
             state = .locked
+            return
+        }
+        guard let correction = decision.correction else {
+            if decision.centering.isFullyCentered {
+                pendingCorrectionRetryTask?.cancel()
+                pendingCorrectionRetryTask = nil
+                stopSupersededVisualMotionIfNeeded(reason: "人物进入中心死区 STOP")
+                state = .centered
+            } else {
+                // A minor reversal was absorbed for this cycle; the previous
+                // burst decays on its own inside the OM3.
+                state = .locked
+            }
             return
         }
 
@@ -1156,6 +1209,8 @@ final class PersonTrackingCoordinator: ObservableObject {
         canResumeSearch = false
         resetAcquisitionCounters()
         reacquisitionCandidateID = candidateID
+        // The stabilizing candidate is a fresh identity for the control path.
+        resetControlFilters()
         lastValidAtUptime = sample.observedAtUptime
         recentHorizontalObservations.removeAll(keepingCapacity: true)
         lastSubmittedCorrection = nil
@@ -1291,6 +1346,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func prepareForTargetSelection() {
         camera.setPersonTrackingSeed(nil)
+        resetControlFilters()
         phase = .acquiring
         state = .acquiring
         canResumeSearch = false
@@ -1331,6 +1387,7 @@ final class PersonTrackingCoordinator: ObservableObject {
     private func resetTargetState() {
         _ = beginNewMotionGeneration()
         camera.setPersonTrackingSeed(nil)
+        resetControlFilters()
         identityTracker.reset()
         phase = .off
         activeVisionSessionID = nil
@@ -1357,19 +1414,6 @@ final class PersonTrackingCoordinator: ObservableObject {
         hasAnalyzedPeopleFrame = false
         smoothedSelectedDetection = nil
         hasMadeInitialAutomaticSelection = false
-    }
-
-    private func reversesDirection(
-        _ next: PersonTrackingCorrection,
-        comparedWith previous: PersonTrackingCorrection
-    ) -> Bool {
-        let yawReversed = next.yawTenths != 0
-            && previous.yawTenths != 0
-            && (next.yawTenths < 0) != (previous.yawTenths < 0)
-        let pitchReversed = next.pitchTenths != 0
-            && previous.pitchTenths != 0
-            && (next.pitchTenths < 0) != (previous.pitchTenths < 0)
-        return yawReversed || pitchReversed
     }
 
     private static func nanoseconds(_ interval: TimeInterval) -> UInt64 {

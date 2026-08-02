@@ -141,11 +141,12 @@ final class PersonTrackingPolicyTests: XCTestCase {
     }
 
     func testVerticalDirectionMatchesCalibratedOM3Mapping() {
-        // Vertical errors measure against the 0.42 head-room composition
-        // target; centerY 0.20 → error −0.22 in the small→medium band.
+        // The head anchor (box top + 0.25 × height) against the 0.32 target
+        // reproduces the old center-based error for the standard test box:
+        // centerY 0.20 → error −0.22, minimum→medium ramp → 5 + 0.7·15 ≈ 16.
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.20)),
-            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -19)
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -16)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.90)),
@@ -163,6 +164,205 @@ final class PersonTrackingPolicyTests: XCTestCase {
         )
         XCTAssertLessThanOrEqual(magnitude, 65.1)
         XCTAssertNotEqual(correction.pitchTenths, 0)
+    }
+
+    func testPredictiveAimLeadsMovingTarget() throws {
+        let still = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.66,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        let moving = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.66,
+            anchorY: 0.32,
+            velocityX: 0.5,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        let stillYaw = try XCTUnwrap(still.correction).yawTenths
+        let movingYaw = try XCTUnwrap(moving.correction).yawTenths
+        XCTAssertGreaterThan(movingYaw, stillYaw,
+                             "a rightward-moving target must get a larger lead correction")
+
+        let runaway = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.66,
+            anchorY: 0.32,
+            velocityX: 50,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        let cappedError = 0.66 + PersonTrackingPolicy.maximumPredictionLead - 0.5
+        XCTAssertLessThan(cappedError, 0.34, "capped lead must stay below the max band here")
+        XCTAssertEqual(
+            try XCTUnwrap(runaway.correction).yawTenths,
+            try XCTUnwrap(
+                PersonTrackingPolicy.predictiveCorrection(
+                    anchorX: 0.66 + PersonTrackingPolicy.maximumPredictionLead,
+                    anchorY: 0.32,
+                    velocityX: 0,
+                    velocityY: 0,
+                    centering: .uncentered,
+                    previousCorrection: nil,
+                    speedMode: .fast
+                ).correction
+            ).yawTenths,
+            "the prediction lead must clamp at maximumPredictionLead"
+        )
+    }
+
+    func testDeadZoneHysteresisKeepsCorrectingUntilInnerZone() {
+        // Centered regime: an error inside the outer dead zone stays centered.
+        let centered = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.60,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .centered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        XCTAssertNil(centered.correction)
+        XCTAssertTrue(centered.centering.yawCentered)
+
+        // Correcting regime: the same error keeps a minimum nudge going.
+        let correcting = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.60,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        XCTAssertEqual(correcting.correction?.yawTenths,
+                       PersonTrackingSpeedMode.fast.minimumStepTenths)
+        XCTAssertFalse(correcting.centering.yawCentered)
+
+        // Only inside the inner zone does the axis re-center.
+        let recentered = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.56,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast
+        )
+        XCTAssertNil(recentered.correction)
+        XCTAssertTrue(recentered.centering.yawCentered)
+    }
+
+    func testMinorReversalAbsorbsAxisWithoutStop() {
+        let decision = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.40,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 30, pitchTenths: 0),
+            speedMode: .fast
+        )
+        XCTAssertFalse(decision.requiresReversalStop,
+                       "a sub-threshold reversal must not trigger the STOP path")
+        XCTAssertNil(decision.correction,
+                     "the reversing axis is held for one cycle instead")
+        XCTAssertFalse(decision.centering.yawCentered)
+    }
+
+    func testMajorReversalRequestsStop() {
+        let decision = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.20,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 30, pitchTenths: 0),
+            speedMode: .fast
+        )
+        XCTAssertTrue(decision.requiresReversalStop)
+        XCTAssertNil(decision.correction)
+    }
+
+    func testSlewLimitBoundsMagnitudeGrowthButNotDecay() throws {
+        let growth = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.95,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 5, pitchTenths: 0),
+            speedMode: .fast
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(growth.correction).yawTenths,
+            5 + PersonTrackingPolicy.slewLimitTenths,
+            "magnitude growth must be slew-limited per command"
+        )
+
+        let decay = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.66,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 65, pitchTenths: 0),
+            speedMode: .fast
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(decay.correction).yawTenths, 17,
+            "decaying toward zero must not be slew-limited"
+        )
+    }
+
+    func testHeadAnchorIsStableAgainstBoxHeightChanges() {
+        let armsDown = PersonDetection(
+            x: 0.4, y: 0.30, width: 0.2, height: 0.40, confidence: 0.9
+        )
+        let armsRaised = PersonDetection(
+            x: 0.4, y: 0.30, width: 0.2, height: 0.55, confidence: 0.9
+        )
+        let anchorShift = abs(
+            PersonTrackingPolicy.headAnchorY(for: armsRaised)
+                - PersonTrackingPolicy.headAnchorY(for: armsDown)
+        )
+        let centerShift = abs(armsRaised.centerY - armsDown.centerY)
+        XCTAssertLessThan(anchorShift, centerShift,
+                          "the head anchor must move less than the box center when the box grows")
+    }
+
+    func testOneEuroFilterSmoothsJitterAndTracksMotion() {
+        var filter = OneEuroFilter(minimumCutoff: 1.2, beta: 0.4, derivativeCutoff: 1.0)
+        var time = 100.0
+        filter.filter(0.50, at: time)
+        // Small alternating jitter around a static position is attenuated.
+        var lastOutput = 0.50
+        for index in 0..<20 {
+            time += 0.033
+            let jitter = index.isMultiple(of: 2) ? 0.02 : -0.02
+            lastOutput = filter.filter(0.50 + jitter, at: time)
+        }
+        XCTAssertLessThan(abs(lastOutput - 0.50), 0.01,
+                          "static jitter must be attenuated below half its amplitude")
+
+        // A steady walk is tracked with bounded lag and a sane velocity.
+        var position = 0.50
+        for _ in 0..<30 {
+            time += 0.033
+            position += 0.30 * 0.033
+            lastOutput = filter.filter(position, at: time)
+        }
+        XCTAssertLessThan(abs(lastOutput - position), 0.05,
+                          "filter lag on a moving target must stay small")
+        XCTAssertEqual(filter.velocity, 0.30, accuracy: 0.12,
+                       "the filtered derivative must approximate the true velocity")
     }
 
     func testRevokedVisionLeaseRejectsOperation() {
@@ -208,7 +408,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
                 for: detection(centerX: 0.65, centerY: 0.5),
                 speedMode: .fast
             ),
-            PersonTrackingCorrection(yawTenths: 21, pitchTenths: 0)
+            PersonTrackingCorrection(yawTenths: 14, pitchTenths: 0)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(

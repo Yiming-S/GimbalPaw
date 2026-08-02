@@ -134,7 +134,7 @@ do {
         confidence: 0.9
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .fast)?.yawTenths == 21,
+        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .fast)?.yawTenths == 14,
         "continuous fast tracking must ramp gently near the dead zone"
     )
     expect(
