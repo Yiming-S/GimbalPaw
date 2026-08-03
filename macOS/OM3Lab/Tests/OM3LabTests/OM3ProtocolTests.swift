@@ -49,6 +49,27 @@ final class OM3ProtocolTests: XCTestCase {
         XCTAssertEqual(frame[16], 0xff)
     }
 
+    func testVerticalPersonSearchCorrectionsOccupyPitchField() throws {
+        for (direction, expectedPitch) in [
+            (PersonSearchDirection.up, -PersonSearchPolicy.scanStepTenths),
+            (PersonSearchDirection.down, PersonSearchPolicy.scanStepTenths),
+        ] {
+            let correction = PersonSearchPolicy.requestedStep(direction: direction, mode: .scan)
+            let frame = try OM3Protocol.relativeMove(
+                yawTenths: correction.yawTenths,
+                pitchTenths: correction.pitchTenths,
+                durationTenths: PersonSearchPolicy.scanDurationTenths
+            )
+            XCTAssertEqual(frame[11], 0)
+            XCTAssertEqual(frame[12], 0)
+            let encodedPitch = Int16(
+                bitPattern: UInt16(frame[15]) | UInt16(frame[16]) << 8
+            )
+            XCTAssertEqual(Int(encodedPitch), expectedPitch)
+            XCTAssertEqual(frame[18], PersonSearchPolicy.scanDurationTenths)
+        }
+    }
+
     func testOutOfRangeValueIsRejected() {
         XCTAssertThrowsError(
             try OM3Protocol.rotationMessage(yawTenths: 40_000, pitchTenths: 0)

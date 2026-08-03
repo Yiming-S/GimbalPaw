@@ -31,6 +31,17 @@ async function render() {
   );
 }
 
+async function readdirIfPresent(url) {
+  try {
+    return await readdir(url);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
 test("server-renders the OM3 test console", async () => {
   const response = await render();
   assert.equal(response.status, 200);
@@ -57,7 +68,9 @@ test("encodes the known OM3 relative yaw test frame", () => {
 });
 
 test("removes the disposable preview and ships the social card", async () => {
-  const previewFiles = await readdir(new URL("../app/_sites-preview/", import.meta.url));
+  const previewFiles = await readdirIfPresent(
+    new URL("../app/_sites-preview/", import.meta.url),
+  );
   assert.deepEqual(previewFiles, []);
   await access(new URL("../public/og.png", import.meta.url));
   await assert.rejects(access(new URL("public/_sites-preview", templateRoot)));

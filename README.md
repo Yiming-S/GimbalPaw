@@ -1,10 +1,10 @@
 # GimbalPaw
 
-GimbalPaw 是一套面向 Apple Silicon Mac 的本地人物跟踪与云台联调工具。当前原生应用仍显示为 **OM3 Lab**：它通过 Bluetooth Low Energy（BLE）控制 DJI Osmo Mobile 3（OM3），通过 USB 直接读取外置 UVC 摄像头，并使用 Apple Vision 在 Mac 本机检测和跟踪人物。
+GimbalPaw 是一套面向 Apple Silicon Mac 的本地人物跟踪与云台联调工具。当前原生应用仍显示为 **OM3 Lab**：它通过 Bluetooth Low Energy（BLE）控制 DJI Osmo Mobile 3（OM3），通过 AVFoundation 读取用户选择的 iPhone 连续互通相机或外置 UVC 摄像头，并使用 Apple Vision 在 Mac 本机检测和跟踪人物。
 
 ```text
 Mac mini ── BLE 无线 ──> OM3
-Mac mini <── USB 线 ─── USB 摄像头
+Mac mini <── 无线 / USB ─ iPhone Camera 或外置摄像头
 充电器  ── USB-C 线 ──> OM3（可选，仅供电）
 ```
 
@@ -13,13 +13,20 @@ OM3 的 USB 接口只用于供电，不承担电脑控制或视频传输。摄�
 ## 主要能力
 
 - 记忆并自动重连已经完整验证的 OM3 BLE 设备。
-- 预览 Mac 直连的 USB 摄像头，并在本机运行人物检测。
+- 显示所有可用摄像头供用户选择，记住最后一次成功运行的设备；自动恢复时不会擅自回退到其他设备。
 - 显示画面中的人物候选，默认锁定“人物 1”，也可手动切换目标。
-- 目标出框后按可信离场方向继续搜索，并在安全范围内扫描。
-- 提供可调跟踪速度、STOP、安全确认和运动预算。
-- 在人工逐步确认下执行左右、上下全向行程验证，为跟踪建立保守的非对称安全包络。
+- 人物跟踪同时修正 Pan 和 Tilt；目标出框后按最后可信方向惯性寻找，并在安全包络内执行上下左右二维扫描。
+- 提供平稳、标准、连续极速和“追踪 50×”可调速度档，以及 STOP、安全确认和运动预算；所有档位都受 OM3 官方最大控制速度 120°/s 硬封顶。
+- 自动执行可信的左、右、上、下四方向安装态标定；未标定时使用回中点起左右各 120°、上下各 60° 的保守包络，标定后可按当前安装扩大范围。
 
-> 这是实验性硬件控制软件。OM3 没有向应用提供可靠姿态回读，BLE 无响应写入也没有设备 ACK。第一次运行必须空载、低速验证，给摄像头软线留足余量，并始终保留物理断电手段。
+> 这是实验性硬件控制软件。OM3 没有向应用提供可靠姿态回读，BLE 无响应写入也没有设备 ACK。DJI 公布的结构活动范围不是从 App 回中点起的对称可控边界。第一次运行必须在周围净空、设备调平和载荷配平后低速验证，给摄像头软线留足余量，并始终保留物理断电手段。
+
+## OM3 官方资料
+
+- [DJI Osmo Mobile 3 中文用户手册](https://dl.djicdn.com/downloads/Osmo_Mobile_3/Osmo_Mobile_3_User_Manual_v1.0_cn.pdf)
+- [DJI Osmo Mobile 3 支持与规格页](https://www.dji.com/support/product/osmo-mobile-3)
+- [DJI 云台俯仰角度范围说明](https://repair.dji.com/help/content?customId=01700006553&documentType=&lang=zh-CN&paperDocType=ARTICLE&re=CN&spaceId=17)
+- [DJI Osmo Mobile 3 免责声明和安全操作指引](https://dl.djicdn.com/downloads/Osmo_Mobile_3/Osmo_Mobile_3_Disclaimer_and_Safety_Guidelines.pdf)
 
 ## 仓库结构
 
@@ -64,3 +71,7 @@ npm run dev
 OM3 没有公开的 macOS 控制 SDK。本项目仅使用社区逆向验证的 FFF0 / FFF4 / FFF5 GATT 特征和 DJI DUML 控制帧，不尝试固件操作。协议研究参考 [`alkersan/om-research`](https://github.com/alkersan/om-research)。
 
 本项目不是 DJI 官方软件，与 DJI 无关联。DJI、Osmo 和 OM3 是其各自权利人的商标。
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。

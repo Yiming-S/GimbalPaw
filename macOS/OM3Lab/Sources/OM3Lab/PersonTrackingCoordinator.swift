@@ -60,14 +60,10 @@ private enum PersonTrackingPhase: Equatable {
     }
 }
 
-private struct HorizontalObservation {
-    let centerX: Double
-    let confidence: Float
-}
-
 @MainActor
 final class PersonTrackingCoordinator: ObservableObject {
     private static let speedModeDefaultsKey = "personTracking.speedMode"
+    private static let speedProfileVersionKey = "personTracking.speedProfileVersion"
     private static let reacquisitionFrames = 5
     private static let reacquisitionDuration: TimeInterval = 0.40
     private static let reacquisitionMinimumConfidence: Float = 0.65
@@ -75,7 +71,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     @Published private(set) var enabled = false
     @Published private(set) var canEnable = false
-    @Published private(set) var speedMode: PersonTrackingSpeedMode = .fast
+    @Published private(set) var speedMode: PersonTrackingSpeedMode = .turbo50x
 
     // These change on the ~12.5 Hz vision cadence, and @Published fires
     // objectWillChange on every assignment even when the value is identical.
@@ -118,22 +114,28 @@ final class PersonTrackingCoordinator: ObservableObject {
     private var phase: PersonTrackingPhase = .off
     private var motionGeneration: UInt64 = 0
     private var lastSequence: UInt64 = 0
-    private var lastVisionSampleAtUptime: TimeInterval = 0
+    private var visionHealth = PersonTrackingVisionHealth()
     private var lastValidAtUptime: TimeInterval = 0
     private var consecutiveValidDetections = 0
     private var consecutiveMisses = 0
     private var acquisitionStartedAtUptime: TimeInterval?
     private var lastAcquisitionDetection: PersonDetection?
     private var reversalBlockedUntilUptime: TimeInterval = 0
+    /// Direction/magnitude history used only by the reversal and slew policy.
     private var lastSubmittedCorrection: PersonTrackingCorrection?
-    private var centerStopIssued = false
-    private var recentHorizontalObservations: [HorizontalObservation] = []
-    private var lastKnownYawDirection: PersonSearchDirection = .right
+    /// Independent physical state: consuming direction history for a minor
+    /// reversal does not prove the previously submitted burst has stopped.
+    private var visualCorrectionMayBeActive = false
+    private var lastSearchCorrection: PersonTrackingCorrection?
+    private var recentSearchObservations: [PersonSearchObservation] = []
+    private var lastKnownDirection: PersonSearchDirection = .right
     private var searchDirection: PersonSearchDirection = .right
     private var searchHasReachedBoundary = false
     private var searchEpisodeStartedAtUptime: TimeInterval = 0
     private var searchEpisodeTravelTenths = 0
-    private var searchBoundaryTouches = 0
+    private var searchLegLength = 1
+    private var searchLegProgress = 0
+    private var searchLegsAtCurrentLength = 0
     private var resumeSearchAfterCandidate = false
     private var reacquisitionCandidateID: PersonCandidateID?
     private var identityTracker = PersonIdentityTracker()
@@ -161,12 +163,22 @@ final class PersonTrackingCoordinator: ObservableObject {
         self.bluetooth = bluetooth
         self.camera = camera
         let defaults = UserDefaults.standard
-        if let storedObject = defaults.object(forKey: Self.speedModeDefaultsKey) {
-            let rawValue = (storedObject as? NSNumber)?.intValue
-            speedMode = rawValue.flatMap(PersonTrackingSpeedMode.init(rawValue:))
-                ?? .standard
-        } else {
-            speedMode = .fast
+        let storedRawValue = (defaults.object(forKey: Self.speedModeDefaultsKey)
+            as? NSNumber)?.intValue
+        let storedProfileVersion = (defaults.object(
+            forKey: Self.speedProfileVersionKey
+        ) as? NSNumber)?.intValue
+        let selection = PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: storedRawValue,
+            storedProfileVersion: storedProfileVersion
+        )
+        speedMode = selection.mode
+        if selection.requiresWriteback {
+            defaults.set(selection.mode.rawValue, forKey: Self.speedModeDefaultsKey)
+            defaults.set(
+                PersonTrackingSpeedSelectionPolicy.currentProfileVersion,
+                forKey: Self.speedProfileVersionKey
+            )
         }
 
         bluetooth.statePublisher
@@ -267,14 +279,19 @@ final class PersonTrackingCoordinator: ObservableObject {
               let sessionID,
               phase != .motionPaused,
               candidateID != selectedPersonID,
-              identityTracker.lock(on: candidateID)
+              visiblePeople.contains(where: { $0.id == candidateID })
         else { return }
 
         _ = beginNewMotionGeneration()
-        bluetooth.pausePersonTrackingWithStop(
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: "切换锁定人物 STOP"
         )
+        guard acceptCriticalStop(
+            stopped,
+            failureReason: "切换人物前 STOP 未被云台接受；自动运动已锁定"
+        ), identityTracker.lock(on: candidateID)
+        else { return }
         hasMadeInitialAutomaticSelection = true
         prepareForTargetSelection()
         publishIdentitySnapshot(identityTracker.currentSnapshot)
@@ -287,10 +304,14 @@ final class PersonTrackingCoordinator: ObservableObject {
               let sessionID
         else { return }
         _ = beginNewMotionGeneration()
-        bluetooth.pausePersonTrackingWithStop(
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: "取消人物锁定 STOP"
         )
+        guard acceptCriticalStop(
+            stopped,
+            failureReason: "取消人物前 STOP 未被云台接受；自动运动已锁定"
+        ) else { return }
         identityTracker.clearLock()
         hasMadeInitialAutomaticSelection = true
         prepareForTargetSelection()
@@ -377,13 +398,12 @@ final class PersonTrackingCoordinator: ObservableObject {
         activeVisionSessionID = sample.sessionID
 
         let now = ProcessInfo.processInfo.systemUptime
-        // A sample that is too old to steer motion still proves the vision
-        // pipeline is alive. Recording it before the freshness gate keeps the
-        // scan stall detector from treating flowing-but-late frames as a
-        // frozen camera and pausing every search episode at its first step.
-        lastVisionSampleAtUptime = sample.observedAtUptime
         hasAnalyzedPeopleFrame = true
-        guard now - sample.observedAtUptime <= sessionSpeedMode.maximumSampleAge else {
+        guard visionHealth.record(
+            sampleObservedAtUptime: sample.observedAtUptime,
+            receivedAtUptime: now,
+            maximumSampleAge: sessionSpeedMode.maximumSampleAge
+        ) else {
             return
         }
 
@@ -490,7 +510,9 @@ final class PersonTrackingCoordinator: ObservableObject {
     private func resetControlFilters() {
         controlFilterX.reset()
         controlFilterY.reset()
-        centeringState = .uncentered
+        // A new target starts in the centered hysteresis regime: it must leave
+        // the outer dead zone before automatic motion begins.
+        centeringState = .centered
     }
 
     private func handleMissingObservation(_ sample: PersonVisionSample) {
@@ -503,10 +525,10 @@ final class PersonTrackingCoordinator: ObservableObject {
 
         switch phase {
         case .following:
-            stopSupersededVisualMotionIfNeeded(
+            guard stopSupersededVisualMotionIfNeeded(
                 reason: "人物首次出框 STOP",
                 cooldownOverride: PersonSearchPolicy.lossGraceStopCooldown
-            )
+            ) else { return }
             phase = .lossGrace
             state = .lossGrace
         case .lossGrace:
@@ -736,12 +758,14 @@ final class PersonTrackingCoordinator: ObservableObject {
         resumeSearchAfterCandidate = false
         searchEpisodeStartedAtUptime = 0
         searchEpisodeTravelTenths = 0
-        searchBoundaryTouches = 0
+        resetSearchSpiral()
         searchHasReachedBoundary = false
         consecutiveMisses = 0
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
-        recentHorizontalObservations.removeAll(keepingCapacity: true)
+        visualCorrectionMayBeActive = false
+        lastSearchCorrection = nil
+        recentSearchObservations.removeAll(keepingCapacity: true)
         state = .locked
         processFollowingDetection(detection, sample: sample)
     }
@@ -759,8 +783,14 @@ final class PersonTrackingCoordinator: ObservableObject {
             // validity of the target.
             consecutiveMisses = 0
             lastValidAtUptime = sample.observedAtUptime
-            recordHorizontalObservation(detection)
+            recordSearchObservation(detection)
         }
+
+        // Every fresh vision decision supersedes a retry derived from an older
+        // frame. In particular, a held direction reversal must not race an old
+        // command back onto the gimbal after this cycle.
+        pendingCorrectionRetryTask?.cancel()
+        pendingCorrectionRetryTask = nil
 
         let now = ProcessInfo.processInfo.systemUptime
         guard now >= reversalBlockedUntilUptime else {
@@ -779,16 +809,23 @@ final class PersonTrackingCoordinator: ObservableObject {
             speedMode: sessionSpeedMode
         )
         centeringState = decision.centering
+        if !decision.minorReversalAxes.isEmpty {
+            lastSubmittedCorrection = decision.minorReversalAxes.consuming(
+                lastSubmittedCorrection
+            )
+        }
 
         if decision.requiresReversalStop {
             reversalBlockedUntilUptime = now + PersonTrackingPolicy.reversalPauseDuration
             _ = beginNewMotionGeneration()
-            bluetooth.pausePersonTrackingWithStop(
+            let stopped = bluetooth.pausePersonTrackingWithStop(
                 session: sessionID,
                 reason: "人物方向反转 STOP"
             )
-            centerStopIssued = true
-            lastSubmittedCorrection = nil
+            guard acceptCriticalStop(
+                stopped,
+                failureReason: "方向反转 STOP 未被云台接受；自动运动已锁定"
+            ) else { return }
             state = .locked
             return
         }
@@ -796,7 +833,9 @@ final class PersonTrackingCoordinator: ObservableObject {
             if decision.centering.isFullyCentered {
                 pendingCorrectionRetryTask?.cancel()
                 pendingCorrectionRetryTask = nil
-                stopSupersededVisualMotionIfNeeded(reason: "人物进入中心死区 STOP")
+                guard stopSupersededVisualMotionIfNeeded(
+                    reason: "人物进入中心死区 STOP"
+                ) else { return }
                 state = .centered
             } else {
                 // A minor reversal was absorbed for this cycle; the previous
@@ -909,11 +948,18 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func acceptSubmittedCorrection(_ correction: PersonTrackingCorrection) {
         lastSubmittedCorrection = correction
-        centerStopIssued = false
-        if correction.yawTenths > 0 {
-            lastKnownYawDirection = .right
+        visualCorrectionMayBeActive = true
+        lastSearchCorrection = correction
+        if abs(correction.pitchTenths) > abs(correction.yawTenths) {
+            if correction.pitchTenths > 0 {
+                lastKnownDirection = .down
+            } else if correction.pitchTenths < 0 {
+                lastKnownDirection = .up
+            }
+        } else if correction.yawTenths > 0 {
+            lastKnownDirection = .right
         } else if correction.yawTenths < 0 {
-            lastKnownYawDirection = .left
+            lastKnownDirection = .left
         }
         state = .correcting
     }
@@ -968,8 +1014,9 @@ final class PersonTrackingCoordinator: ObservableObject {
                     }
                 ) else { return }
                 switch result {
-                case let .submitted(yawTenths, reachesSoftBoundary):
-                    submittedTravelTenths += abs(yawTenths)
+                case let .submitted(correction, reachesSoftBoundary):
+                    submittedTravelTenths += abs(correction.yawTenths)
+                        + abs(correction.pitchTenths)
                     if reachesSoftBoundary {
                         do {
                             try await Task.sleep(nanoseconds: Self.nanoseconds(coastDuration))
@@ -1031,11 +1078,11 @@ final class PersonTrackingCoordinator: ObservableObject {
         else { return }
 
         if resetEpisode {
-            searchDirection = lastKnownYawDirection
+            searchDirection = lastKnownDirection
             searchHasReachedBoundary = false
             searchEpisodeStartedAtUptime = ProcessInfo.processInfo.systemUptime
             searchEpisodeTravelTenths = 0
-            searchBoundaryTouches = 0
+            resetSearchSpiral()
         }
         let generation = beginNewMotionGeneration()
         phase = .searching
@@ -1044,11 +1091,14 @@ final class PersonTrackingCoordinator: ObservableObject {
             : .searching(searchDirection)
         canResumeSearch = false
         resetAcquisitionCounters()
-        lastSubmittedCorrection = nil
-        bluetooth.pausePersonTrackingWithStop(
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: "人物出框，自动搜索前 STOP"
         )
+        guard acceptCriticalStop(
+            stopped,
+            failureReason: "搜索前 STOP 未被云台接受；自动运动已锁定"
+        ) else { return }
 
         let initialDelay = max(
             PersonSearchPolicy.scanSettleDuration,
@@ -1073,11 +1123,33 @@ final class PersonTrackingCoordinator: ObservableObject {
                 let scanDuration = Double(PersonSearchPolicy.scanDurationTenths) / 10.0
                 let episodeDeadline = self.searchEpisodeStartedAtUptime
                     + PersonSearchPolicy.maximumScanEpisodeDuration
-                if self.lastVisionSampleAtUptime == 0
-                    || now - self.lastVisionSampleAtUptime
-                    > PersonSearchPolicy.maximumVisionSilence {
+                switch self.visionHealth.motionSafety(
+                    at: now,
+                    maximumSilence: PersonSearchPolicy.maximumVisionSilence
+                ) {
+                case .safe:
+                    break
+                case .pipelineStalled:
                     self.pauseAutomaticMotion(
                         reason: "摄像头画面已停滞，扫描保持静止",
+                        resumable: true
+                    )
+                    return
+                case .samplesTooOld:
+                    self.pauseAutomaticMotion(
+                        reason: "摄像头画面延迟过高，扫描保持静止",
+                        resumable: true
+                    )
+                    return
+                }
+                guard let visionDeadline = self.visionHealth
+                    .motionAuthorizationDeadline(
+                        maximumSilence: PersonSearchPolicy.maximumVisionSilence
+                    ),
+                    now + scanDuration <= visionDeadline
+                else {
+                    self.pauseAutomaticMotion(
+                        reason: "新鲜画面授权不足以完成下一步扫描，扫描保持静止",
                         resumable: true
                     )
                     return
@@ -1092,6 +1164,7 @@ final class PersonTrackingCoordinator: ObservableObject {
                     )
                     return
                 }
+                let commandDeadline = min(episodeDeadline, visionDeadline)
 
                 guard let result = self.camera.withValidPersonTrackingSession(
                     visionSessionID,
@@ -1100,30 +1173,20 @@ final class PersonTrackingCoordinator: ObservableObject {
                             direction: self.searchDirection,
                             mode: .scan,
                             requestedAtUptime: now,
-                            mustFinishByUptime: episodeDeadline,
+                            mustFinishByUptime: commandDeadline,
                             session: sessionID
                         )
                     }
                 ) else { return }
                 switch result {
-                case let .submitted(yawTenths, reachesSoftBoundary):
+                case let .submitted(correction, reachesSoftBoundary):
                     busyStartedAtUptime = nil
-                    self.searchEpisodeTravelTenths += abs(yawTenths)
-                    if reachesSoftBoundary {
-                        do {
-                            try await Task.sleep(
-                                nanoseconds: Self.nanoseconds(
-                                    scanDuration
-                                )
-                            )
-                        } catch {
-                            return
-                        }
-                        guard self.motionGeneration == generation,
-                              self.phase == .searching
-                        else { return }
-                        self.handleSearchBoundaryReached()
-                        return
+                    self.searchEpisodeTravelTenths += abs(correction.yawTenths)
+                        + abs(correction.pitchTenths)
+                    self.searchLegProgress += 1
+                    if reachesSoftBoundary
+                        || self.searchLegProgress >= self.searchLegLength {
+                        self.advanceSearchLeg()
                     }
                     let remaining = max(
                         0,
@@ -1157,8 +1220,18 @@ final class PersonTrackingCoordinator: ObservableObject {
                         return
                     }
                 case .softBoundaryReached:
-                    self.handleSearchBoundaryReached()
-                    return
+                    busyStartedAtUptime = nil
+                    self.searchHasReachedBoundary = true
+                    self.advanceSearchLeg()
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: Self.nanoseconds(
+                                PersonSearchPolicy.scanSettleDuration
+                            )
+                        )
+                    } catch {
+                        return
+                    }
                 case .hardBoundaryReached:
                     self.pauseAutomaticMotion(
                         reason: "已到当前安全包络边界；请关闭跟踪、人工回正并重新确认",
@@ -1179,18 +1252,22 @@ final class PersonTrackingCoordinator: ObservableObject {
         }
     }
 
-    private func handleSearchBoundaryReached() {
-        searchBoundaryTouches += 1
-        guard searchBoundaryTouches < PersonSearchPolicy.maximumScanBoundaryTouches else {
-            pauseAutomaticMotion(
-                reason: "已完成本轮左右扫描，可点击继续扫描",
-                resumable: true
-            )
-            return
-        }
+    private func resetSearchSpiral() {
+        searchLegLength = 1
+        searchLegProgress = 0
+        searchLegsAtCurrentLength = 0
+    }
+
+    private func advanceSearchLeg() {
         searchHasReachedBoundary = true
-        searchDirection = searchDirection.opposite
-        beginSearchEpisode(resetEpisode: false)
+        searchLegProgress = 0
+        searchLegsAtCurrentLength += 1
+        if searchLegsAtCurrentLength >= 2 {
+            searchLegLength += 1
+            searchLegsAtCurrentLength = 0
+        }
+        searchDirection = searchDirection.clockwise
+        state = .scanning(searchDirection)
     }
 
     private func beginReacquisition(
@@ -1212,12 +1289,15 @@ final class PersonTrackingCoordinator: ObservableObject {
         // The stabilizing candidate is a fresh identity for the control path.
         resetControlFilters()
         lastValidAtUptime = sample.observedAtUptime
-        recentHorizontalObservations.removeAll(keepingCapacity: true)
-        lastSubmittedCorrection = nil
-        bluetooth.pausePersonTrackingWithStop(
+        recentSearchObservations.removeAll(keepingCapacity: true)
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: "扫描发现人物候选 STOP"
         )
+        guard acceptCriticalStop(
+            stopped,
+            failureReason: "发现候选后的 STOP 未被云台接受；自动运动已锁定"
+        ) else { return }
     }
 
     private func pauseAutomaticMotion(reason: String, resumable: Bool) {
@@ -1231,9 +1311,13 @@ final class PersonTrackingCoordinator: ObservableObject {
             phase = .motionPaused
             state = .motionPaused(reason)
         }
-        bluetooth.pausePersonTrackingWithStop(
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: "人物搜索安全暂停 STOP"
+        )
+        _ = acceptCriticalStop(
+            stopped,
+            failureReason: "人物搜索安全暂停 STOP 未被云台接受；自动运动已锁定"
         )
     }
 
@@ -1254,6 +1338,27 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     private func checkForLostTarget() {
         let now = ProcessInfo.processInfo.systemUptime
+        if phase == .searching {
+            switch visionHealth.motionSafety(
+                at: now,
+                maximumSilence: PersonSearchPolicy.maximumVisionSilence
+            ) {
+            case .safe:
+                break
+            case .pipelineStalled:
+                pauseAutomaticMotion(
+                    reason: "摄像头画面已停滞，扫描保持静止",
+                    resumable: true
+                )
+                return
+            case .samplesTooOld:
+                pauseAutomaticMotion(
+                    reason: "摄像头画面延迟过高，扫描保持静止",
+                    resumable: true
+                )
+                return
+            }
+        }
         if phase.carriesLockedTarget,
            lastValidAtUptime > 0,
            now - lastValidAtUptime > PersonTrackingPolicy.lostTimeout {
@@ -1276,28 +1381,27 @@ final class PersonTrackingCoordinator: ObservableObject {
     }
 
     private func trustedCoastDirection() -> PersonSearchDirection? {
-        guard recentHorizontalObservations.count >= 3,
-              let last = recentHorizontalObservations.last,
-              let correction = lastSubmittedCorrection,
-              correction.yawTenths != 0
+        guard recentSearchObservations.count >= 3,
+              let lastSearchCorrection,
+              !lastSearchCorrection.isZero
         else { return nil }
         return PersonSearchPolicy.coastDirection(
-            recentCenterXs: recentHorizontalObservations.map(\.centerX),
-            lastConfidence: last.confidence,
-            lastYawTenths: correction.yawTenths
+            recentObservations: recentSearchObservations,
+            lastCorrection: lastSearchCorrection
         )
     }
 
-    private func recordHorizontalObservation(_ detection: PersonDetection) {
-        recentHorizontalObservations.append(
-            HorizontalObservation(
+    private func recordSearchObservation(_ detection: PersonDetection) {
+        recentSearchObservations.append(
+            PersonSearchObservation(
                 centerX: detection.centerX,
+                centerY: detection.centerY,
                 confidence: detection.confidence
             )
         )
-        if recentHorizontalObservations.count > 4 {
-            recentHorizontalObservations.removeFirst(
-                recentHorizontalObservations.count - 4
+        if recentSearchObservations.count > 4 {
+            recentSearchObservations.removeFirst(
+                recentSearchObservations.count - 4
             )
         }
     }
@@ -1355,14 +1459,15 @@ final class PersonTrackingCoordinator: ObservableObject {
         resetAcquisitionCounters()
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
-        centerStopIssued = true
-        recentHorizontalObservations.removeAll(keepingCapacity: true)
-        lastKnownYawDirection = .right
+        visualCorrectionMayBeActive = false
+        lastSearchCorrection = nil
+        recentSearchObservations.removeAll(keepingCapacity: true)
+        lastKnownDirection = .right
         searchDirection = .right
         searchHasReachedBoundary = false
         searchEpisodeStartedAtUptime = 0
         searchEpisodeTravelTenths = 0
-        searchBoundaryTouches = 0
+        resetSearchSpiral()
         resumeSearchAfterCandidate = false
         smoothedSelectedDetection = nil
     }
@@ -1370,18 +1475,38 @@ final class PersonTrackingCoordinator: ObservableObject {
     private func stopSupersededVisualMotionIfNeeded(
         reason: String,
         cooldownOverride: TimeInterval? = nil
-    ) {
-        guard !centerStopIssued,
-              lastSubmittedCorrection != nil,
-              let sessionID
-        else { return }
+    ) -> Bool {
+        guard visualCorrectionMayBeActive, let sessionID
+        else { return true }
         _ = beginNewMotionGeneration()
-        centerStopIssued = true
-        bluetooth.pausePersonTrackingWithStop(
+        let stopped = bluetooth.pausePersonTrackingWithStop(
             session: sessionID,
             reason: reason,
             cooldownOverride: cooldownOverride
         )
+        return acceptCriticalStop(
+            stopped,
+            failureReason: "\(reason) 未被云台接受；自动运动已锁定"
+        )
+    }
+
+    /// A state transition that depends on STOP must never continue after the
+    /// transport rejects that STOP. The activity marker deliberately remains
+    /// unchanged on failure because the physical burst may still be running.
+    private func acceptCriticalStop(
+        _ stopped: Bool,
+        failureReason: String
+    ) -> Bool {
+        guard stopped else {
+            _ = beginNewMotionGeneration()
+            canResumeSearch = false
+            phase = .motionPaused
+            state = .motionPaused(failureReason)
+            return false
+        }
+        visualCorrectionMayBeActive = false
+        lastSubmittedCorrection = nil
+        return true
     }
 
     private func resetTargetState() {
@@ -1392,20 +1517,21 @@ final class PersonTrackingCoordinator: ObservableObject {
         phase = .off
         activeVisionSessionID = nil
         lastSequence = 0
-        lastVisionSampleAtUptime = 0
+        visionHealth = PersonTrackingVisionHealth()
         lastValidAtUptime = 0
         consecutiveMisses = 0
         resetAcquisitionCounters()
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
-        centerStopIssued = false
-        recentHorizontalObservations.removeAll(keepingCapacity: true)
-        lastKnownYawDirection = .right
+        visualCorrectionMayBeActive = false
+        lastSearchCorrection = nil
+        recentSearchObservations.removeAll(keepingCapacity: true)
+        lastKnownDirection = .right
         searchDirection = .right
         searchHasReachedBoundary = false
         searchEpisodeStartedAtUptime = 0
         searchEpisodeTravelTenths = 0
-        searchBoundaryTouches = 0
+        resetSearchSpiral()
         resumeSearchAfterCandidate = false
         canResumeSearch = false
         visiblePeople = []

@@ -23,7 +23,11 @@ private final class MockTrackingBluetooth: PersonTrackingBluetoothControlling {
     )
     private let nudgeSubject = CurrentValueSubject<Bool, Never>(true)
     private let originSubject = CurrentValueSubject<Bool, Never>(true)
-    private let activeSubject = CurrentValueSubject<Bool, Never>(false)
+    // The coordinator reads the current value directly for initial availability;
+    // publisher events model subsequent session transitions only. A current-
+    // value subject would enqueue a stale initial `false` through receive(on:)
+    // and could tear down a just-started async test session.
+    private let activeSubject = PassthroughSubject<Bool, Never>()
 
     var statePublisher: AnyPublisher<OM3ConnectionState, Never> {
         stateSubject.eraseToAnyPublisher()
@@ -39,8 +43,15 @@ private final class MockTrackingBluetooth: PersonTrackingBluetoothControlling {
     }
 
     private(set) var submittedCorrections: [PersonTrackingCorrection] = []
+    private(set) var correctionAttempts: [PersonTrackingCorrection] = []
+    var scriptedCorrectionResults: [PersonTrackingCommandResult] = []
     private(set) var searchStepModes: [PersonSearchMotionMode] = []
+    private(set) var searchDirections: [PersonSearchDirection] = []
+    private(set) var searchCorrections: [PersonTrackingCorrection] = []
+    var scriptedSearchResults: [PersonSearchCommandResult] = []
     private(set) var stopReasons: [String] = []
+    private(set) var stopAttempts: [String] = []
+    var scriptedStopResults: [Bool] = []
     private(set) var activeSession: UUID?
 
     func beginPersonTracking(speedMode: PersonTrackingSpeedMode) -> UUID? {
@@ -56,8 +67,14 @@ private final class MockTrackingBluetooth: PersonTrackingBluetoothControlling {
         session: UUID
     ) -> PersonTrackingCommandResult {
         guard session == activeSession else { return .inactive }
-        submittedCorrections.append(correction)
-        return .submitted(correction)
+        correctionAttempts.append(correction)
+        let result = scriptedCorrectionResults.isEmpty
+            ? .submitted(correction)
+            : scriptedCorrectionResults.removeFirst()
+        if case let .submitted(submittedCorrection) = result {
+            submittedCorrections.append(submittedCorrection)
+        }
+        return result
     }
 
     func sendPersonSearchStep(
@@ -69,8 +86,14 @@ private final class MockTrackingBluetooth: PersonTrackingBluetoothControlling {
     ) -> PersonSearchCommandResult {
         guard session == activeSession else { return .inactive }
         searchStepModes.append(mode)
+        searchDirections.append(direction)
+        if !scriptedSearchResults.isEmpty {
+            return scriptedSearchResults.removeFirst()
+        }
+        let correction = PersonSearchPolicy.requestedStep(direction: direction, mode: mode)
+        searchCorrections.append(correction)
         return .submitted(
-            yawTenths: direction.rawValue * PersonSearchPolicy.scanStepTenths,
+            correction: correction,
             reachesSoftBoundary: false
         )
     }
@@ -81,6 +104,11 @@ private final class MockTrackingBluetooth: PersonTrackingBluetoothControlling {
         cooldownOverride: TimeInterval?
     ) -> Bool {
         guard session == activeSession else { return false }
+        stopAttempts.append(reason)
+        let accepted = scriptedStopResults.isEmpty
+            ? true
+            : scriptedStopResults.removeFirst()
+        guard accepted else { return false }
         stopReasons.append(reason)
         return true
     }
@@ -203,14 +231,15 @@ final class PersonTrackingCoordinatorTests: XCTestCase {
     @discardableResult
     private func acquireLock(
         centerX: Double,
+        centerY: Double = 0.42,
         base: TimeInterval
     ) -> TimeInterval {
         coordinator.setEnabled(true)
         XCTAssertTrue(coordinator.enabled, "tracking must enable with ready mocks")
-        send([person(centerX: centerX)], at: base)
-        send([person(centerX: centerX)], at: base + 0.12)
+        send([person(centerX: centerX, centerY: centerY)], at: base)
+        send([person(centerX: centerX, centerY: centerY)], at: base + 0.12)
         let lastValid = base + 0.26
-        send([person(centerX: centerX)], at: lastValid)
+        send([person(centerX: centerX, centerY: centerY)], at: lastValid)
         XCTAssertNotNil(coordinator.selectedPersonID, "first candidate must auto-lock")
         return lastValid
     }
@@ -222,6 +251,190 @@ final class PersonTrackingCoordinatorTests: XCTestCase {
         XCTAssertLessThan(bluetooth.submittedCorrections[0].yawTenths, 0)
         XCTAssertFalse(camera.seedHistory.compactMap { $0 }.isEmpty,
                        "detector frames must seed the correlation tracker")
+    }
+
+    func testAcquisitionSubmitsUpwardAndDownwardPitchCorrections() {
+        var base = ProcessInfo.processInfo.systemUptime
+        acquireLock(centerX: 0.50, centerY: 0.30, base: base)
+        XCTAssertEqual(bluetooth.submittedCorrections.count, 1)
+        XCTAssertEqual(bluetooth.submittedCorrections[0].yawTenths, 0)
+        XCTAssertLessThan(bluetooth.submittedCorrections[0].pitchTenths, 0)
+
+        coordinator.setEnabled(false)
+        bluetooth = MockTrackingBluetooth()
+        camera = MockTrackingCamera()
+        coordinator = PersonTrackingCoordinator(bluetooth: bluetooth, camera: camera)
+        coordinator.setSpeedMode(.fast)
+        coordinator.setAppActive(true)
+        coordinator.setSafetyArmed(true)
+        sequence = 0
+        base = ProcessInfo.processInfo.systemUptime
+        acquireLock(centerX: 0.50, centerY: 0.56, base: base)
+        XCTAssertEqual(bluetooth.submittedCorrections.count, 1)
+        XCTAssertEqual(bluetooth.submittedCorrections[0].yawTenths, 0)
+        XCTAssertGreaterThan(bluetooth.submittedCorrections[0].pitchTenths, 0)
+    }
+
+    func testMajorPitchReversalUsesCriticalStopPath() {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.50, centerY: 0.25, base: base)
+        XCTAssertLessThan(bluetooth.submittedCorrections.last?.pitchTenths ?? 0, 0)
+
+        sendTracker(person(centerX: 0.50, centerY: 0.90), at: lastValid + 0.10)
+        XCTAssertTrue(
+            bluetooth.stopReasons.contains { $0.contains("方向反转") },
+            "a significant up-to-down Pitch reversal must issue STOP"
+        )
+    }
+
+    func testInitialLockUsesOuterDeadZoneBeforeMoving() {
+        let base = ProcessInfo.processInfo.systemUptime
+        acquireLock(centerX: 0.60, base: base)
+
+        XCTAssertTrue(
+            bluetooth.submittedCorrections.isEmpty,
+            "a new lock inside the outer dead zone must not receive a minimum nudge"
+        )
+        XCTAssertEqual(coordinator.state, .centered)
+    }
+
+    func testCenterStopClearsOldDirectionBeforeOppositeDeparture() {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.30, base: base)
+        XCTAssertEqual(bluetooth.submittedCorrections.count, 1)
+        XCTAssertLessThan(bluetooth.submittedCorrections[0].yawTenths, 0)
+
+        send([person(centerX: 0.50)], at: lastValid + 0.10)
+        XCTAssertEqual(coordinator.state, .centered)
+        XCTAssertTrue(
+            bluetooth.stopReasons.contains { $0.contains("进入中心死区") },
+            "entering the center after a burst must issue STOP"
+        )
+        let reversalStopsBeforeDeparture = bluetooth.stopReasons.filter {
+            $0.contains("方向反转")
+        }.count
+
+        send([person(centerX: 0.70)], at: lastValid + 0.20)
+        XCTAssertEqual(
+            bluetooth.stopReasons.filter { $0.contains("方向反转") }.count,
+            reversalStopsBeforeDeparture,
+            "a burst that already ended with STOP is not active reversal history"
+        )
+        XCTAssertGreaterThan(
+            bluetooth.submittedCorrections.last?.yawTenths ?? 0,
+            0,
+            "the opposite-side departure should move immediately"
+        )
+    }
+
+    func testNewVisionFrameCancelsBusyRetryFromSupersededFrame() async throws {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.70, base: base)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, 1)
+
+        bluetooth.scriptedCorrectionResults = [.busy]
+        sendTracker(person(centerX: 0.70), at: lastValid + 0.02)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, 2)
+
+        // This newer observation supersedes the busy command. Regardless of
+        // whether filtering classifies the change as a minor or major reversal,
+        // the old rightward attempt may never be retried afterward.
+        sendTracker(person(centerX: 0.40), at: lastValid + 0.04)
+        let attemptsAfterNewFrame = bluetooth.correctionAttempts.count
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertEqual(
+            bluetooth.correctionAttempts.count,
+            attemptsAfterNewFrame,
+            "a pending retry from the older frame must be cancelled"
+        )
+    }
+
+    func testMinorReversalStillStopsPossiblyActiveBurstWhenTargetDisappears() {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.70, base: base)
+        XCTAssertEqual(bluetooth.submittedCorrections.count, 1)
+        XCTAssertGreaterThan(bluetooth.submittedCorrections[0].yawTenths, 0)
+
+        // With a 0.10 s filter interval this lands just outside the inner dead
+        // zone in the opposite direction, producing the one-frame minor hold.
+        sendTracker(person(centerX: 0.40), at: lastValid + 0.10)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, 1)
+        XCTAssertEqual(coordinator.state, .locked)
+        XCTAssertFalse(bluetooth.stopReasons.contains { $0.contains("方向反转") })
+
+        send([], at: lastValid + 0.12)
+        XCTAssertEqual(coordinator.state, .lossGrace)
+        XCTAssertTrue(
+            bluetooth.stopReasons.contains { $0.contains("人物首次出框") },
+            "consuming reversal history must not hide a possibly active burst"
+        )
+    }
+
+    func testRejectedFirstLossStopFailsClosedWithoutCoastOrSearch() {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.30, base: base)
+        let correctionAttempts = bluetooth.correctionAttempts.count
+        bluetooth.scriptedStopResults = [false]
+
+        send([], at: lastValid + 0.08)
+        guard case let .motionPaused(reason) = coordinator.state else {
+            XCTFail("rejected loss STOP must fail closed, got \(coordinator.state)")
+            return
+        }
+        XCTAssertTrue(reason.contains("未被云台接受"))
+        XCTAssertTrue(bluetooth.stopAttempts.contains { $0.contains("人物首次出框") })
+
+        send([], at: lastValid + 0.50)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, correctionAttempts)
+        XCTAssertTrue(bluetooth.searchStepModes.isEmpty)
+        XCTAssertFalse(coordinator.canResumeSearch)
+    }
+
+    func testRejectedMajorReversalStopFailsClosedWithoutNewCorrection() {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.70, base: base)
+        let correctionAttempts = bluetooth.correctionAttempts.count
+        bluetooth.scriptedStopResults = [false]
+
+        sendTracker(person(centerX: 0.05), at: lastValid + 0.10)
+        guard case let .motionPaused(reason) = coordinator.state else {
+            XCTFail("rejected reversal STOP must fail closed, got \(coordinator.state)")
+            return
+        }
+        XCTAssertTrue(reason.contains("方向反转 STOP"))
+        XCTAssertTrue(bluetooth.stopAttempts.contains { $0.contains("方向反转") })
+
+        sendTracker(person(centerX: 0.05), at: lastValid + 0.12)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, correctionAttempts)
+        XCTAssertTrue(bluetooth.searchStepModes.isEmpty)
+    }
+
+    func testRejectedPersonSwitchStopKeepsOldSelectionAndFailsClosed() throws {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.30, base: base)
+        let originalID = try XCTUnwrap(coordinator.selectedPersonID)
+        send(
+            [person(centerX: 0.30), person(centerX: 0.70)],
+            at: lastValid + 0.08
+        )
+        let otherID = try XCTUnwrap(
+            coordinator.visiblePeople.first { $0.id != originalID }?.id
+        )
+        let correctionAttempts = bluetooth.correctionAttempts.count
+        bluetooth.scriptedStopResults = [false]
+
+        coordinator.selectPerson(otherID)
+        guard case let .motionPaused(reason) = coordinator.state else {
+            XCTFail("rejected switch STOP must fail closed, got \(coordinator.state)")
+            return
+        }
+        XCTAssertTrue(reason.contains("切换人物"))
+        XCTAssertEqual(coordinator.selectedPersonID, originalID)
+        XCTAssertTrue(bluetooth.stopAttempts.contains { $0.contains("切换锁定人物") })
+
+        send([person(centerX: 0.70)], at: lastValid + 0.16)
+        XCTAssertEqual(bluetooth.correctionAttempts.count, correctionAttempts)
+        XCTAssertTrue(bluetooth.searchStepModes.isEmpty)
     }
 
     func testFlickerKeepsLockAndFollowing() {
@@ -302,6 +515,79 @@ final class PersonTrackingCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             bluetooth.submittedCorrections.count, 2,
             "a tracker sample past the detector bridge window must be ignored"
+        )
+    }
+
+    func testContinuouslyDelayedFramesPauseAutomaticScan() async throws {
+        let base = ProcessInfo.processInfo.systemUptime
+        acquireLock(centerX: 0.30, base: base)
+
+        send([], at: base + 0.34)
+        send([], at: base + 0.42)
+        send([], at: base + 0.70)
+
+        // Keep the detector callback alive, but feed frames older than the fast
+        // profile's steering budget. They must not renew scan authorization.
+        for _ in 0..<9 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            send(
+                [],
+                at: ProcessInfo.processInfo.systemUptime
+                    - PersonTrackingSpeedMode.fast.maximumSampleAge
+                    - 0.05
+            )
+        }
+
+        guard case let .searchPaused(reason) = coordinator.state else {
+            XCTFail("delayed vision must safely pause scanning, got \(coordinator.state)")
+            return
+        }
+        XCTAssertTrue(
+            reason.contains("延迟过高") || reason.contains("授权不足"),
+            "the scan must pause before a motion could outlive fresh vision"
+        )
+        XCTAssertTrue(
+            bluetooth.searchStepModes.isEmpty,
+            "no scan step may start if its full duration exceeds vision authorization"
+        )
+        XCTAssertTrue(coordinator.canResumeSearch)
+    }
+
+    func testTopExitStartsUpwardPitchCoast() async throws {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.50, centerY: 0.22, base: base)
+        send([person(centerX: 0.50, centerY: 0.16)], at: lastValid + 0.06)
+        send([person(centerX: 0.50, centerY: 0.10)], at: lastValid + 0.12)
+        send([], at: lastValid + 0.18)
+        send([], at: lastValid + 0.24)
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        XCTAssertEqual(bluetooth.searchStepModes.first, .coast)
+        XCTAssertEqual(bluetooth.searchDirections.first, .up)
+        XCTAssertEqual(bluetooth.searchCorrections.first?.yawTenths, 0)
+        XCTAssertLessThan(bluetooth.searchCorrections.first?.pitchTenths ?? 0, 0)
+    }
+
+    func testAutomaticScanCyclesAcrossYawAndPitchAxes() async throws {
+        let base = ProcessInfo.processInfo.systemUptime
+        let lastValid = acquireLock(centerX: 0.50, centerY: 0.42, base: base)
+        bluetooth.scriptedSearchResults = Array(
+            repeating: PersonSearchCommandResult.softBoundaryReached,
+            count: 4
+        )
+        send([], at: lastValid + 0.10)
+        send([], at: lastValid + 0.50)
+
+        for _ in 0..<18 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            send([], at: ProcessInfo.processInfo.systemUptime)
+        }
+
+        XCTAssertGreaterThanOrEqual(bluetooth.searchDirections.count, 4)
+        XCTAssertEqual(
+            Array(bluetooth.searchDirections.prefix(4)),
+            [.right, .down, .left, .up],
+            "an unattended scan must not remain on the Yaw axis"
         )
     }
 }

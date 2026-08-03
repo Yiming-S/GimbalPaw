@@ -94,7 +94,26 @@ struct GimbalMotionEstimate: Sendable, Equatable {
     let verdict: GimbalMotionVerdict
 }
 
+/// A single two-dimensional registration result projected onto both gimbal axes.
+/// `zeroError` in each estimate is conditional: the other axis is held at its
+/// jointly fitted shift so primary-axis motion cannot inflate the orthogonal
+/// axis residual.
+struct GimbalMotionVectorEstimate: Sendable, Equatable {
+    let horizontal: GimbalMotionEstimate
+    let vertical: GimbalMotionEstimate
+}
+
 enum GimbalMotionAnalysis {
+    private struct TranslationShift: Hashable {
+        let horizontal: Int
+        let vertical: Int
+    }
+
+    private struct TranslationCandidate {
+        let shift: TranslationShift
+        let error: Double
+    }
+
     private static let minimumTextureScore = 0.012
     private static let maximumExposureDelta = 48.0
     private static let noResponseError = 0.035
@@ -272,6 +291,329 @@ enum GimbalMotionAnalysis {
         )
     }
 
+    /// Fits one global `(horizontal, vertical)` translation and then evaluates
+    /// both axes from that same registration. This is the calibration-facing
+    /// API: unlike two independent one-dimensional estimates, a large shift on
+    /// one axis is compensated before the other axis is classified.
+    static func estimateTranslation(
+        reference: GimbalMotionSignature,
+        current: GimbalMotionSignature
+    ) -> GimbalMotionVectorEstimate {
+        let forward = estimateTranslationOneWay(
+            reference: reference,
+            current: current
+        )
+        guard isConclusive(forward.horizontal),
+              isConclusive(forward.vertical)
+        else {
+            return forward
+        }
+
+        // A fixed reference ROI prevents an edge-only change from disappearing
+        // for one candidate, but a new obstruction inside that ROI can still be
+        // escaped by shifting the current-frame sampling window. Genuine camera
+        // translation must also register in the reverse direction with the same
+        // magnitude and opposite sign. Fold the weaker quality from both passes
+        // into the public result so unattended gates cannot ignore a poor reverse
+        // fit even when the forward fit looks perfect.
+        let reverse = estimateTranslationOneWay(
+            reference: current,
+            current: reference
+        )
+        guard let horizontal = bidirectionallyValidated(
+                forward: forward.horizontal,
+                reverse: reverse.horizontal
+              ),
+              let vertical = bidirectionallyValidated(
+                forward: forward.vertical,
+                reverse: reverse.vertical
+              )
+        else {
+            return jointInconclusive("双向位移验证不一致")
+        }
+        return GimbalMotionVectorEstimate(
+            horizontal: horizontal,
+            vertical: vertical
+        )
+    }
+
+    private static func estimateTranslationOneWay(
+        reference: GimbalMotionSignature,
+        current: GimbalMotionSignature
+    ) -> GimbalMotionVectorEstimate {
+        guard reference.width == current.width,
+              reference.height == current.height,
+              reference.width > 3,
+              reference.height > 3,
+              reference.luma.count == reference.width * reference.height,
+              current.luma.count == current.width * current.height
+        else {
+            return jointInconclusive("画面签名尺寸不一致")
+        }
+
+        guard min(reference.textureScore, current.textureScore) >= minimumTextureScore else {
+            return jointInconclusive("画面纹理不足")
+        }
+
+        let exposureDelta = abs(current.meanLuma - reference.meanLuma)
+        guard exposureDelta <= maximumExposureDelta else {
+            return jointInconclusive("曝光变化过大")
+        }
+
+        let horizontalMaximumShift = min(32, max(3, reference.width / 4))
+        let verticalMaximumShift = min(20, max(3, reference.height / 4))
+        let horizontalRange = -horizontalMaximumShift...horizontalMaximumShift
+        let verticalRange = -verticalMaximumShift...verticalMaximumShift
+        var evaluated: [TranslationShift: Double] = [:]
+        evaluated.reserveCapacity(horizontalRange.count * verticalRange.count)
+
+        func evaluateExact(horizontal: Int, vertical: Int) {
+            guard horizontalRange.contains(horizontal),
+                  verticalRange.contains(vertical)
+            else { return }
+            let shift = TranslationShift(horizontal: horizontal, vertical: vertical)
+            guard evaluated[shift] == nil else { return }
+            evaluated[shift] = compensatedErrorOnCommonROI(
+                reference: reference,
+                current: current,
+                horizontalShift: horizontal,
+                verticalShift: vertical,
+                horizontalMargin: horizontalMaximumShift,
+                verticalMargin: verticalMaximumShift
+            )
+        }
+
+        // Calibration is safety-sensitive and runs off the main actor, so the
+        // complete bounded domain is evaluated with the exact brightness-
+        // compensated metric. This makes the global uniqueness test genuine:
+        // no odd-pixel, diagonal, periodic, or non-seeded alternative can be
+        // omitted by a coarse-to-fine shortlist.
+        for verticalShift in verticalRange {
+            for horizontalShift in horizontalRange {
+                evaluateExact(
+                    horizontal: horizontalShift,
+                    vertical: verticalShift
+                )
+            }
+        }
+
+        guard let best = bestCandidate(in: evaluated) else {
+            return jointInconclusive("画面无法比较")
+        }
+
+        let candidates = evaluated.map {
+            TranslationCandidate(shift: $0.key, error: $0.value)
+        }
+
+        let horizontalCandidates = candidates.compactMap { candidate -> (shift: Int, error: Double)? in
+            guard candidate.shift.vertical == best.shift.vertical else { return nil }
+            return (candidate.shift.horizontal, candidate.error)
+        }
+        let verticalCandidates = candidates.compactMap { candidate -> (shift: Int, error: Double)? in
+            guard candidate.shift.horizontal == best.shift.horizontal else { return nil }
+            return (candidate.shift.vertical, candidate.error)
+        }
+        guard let horizontalZeroError = horizontalCandidates.first(where: { $0.shift == 0 })?.error,
+              let verticalZeroError = verticalCandidates.first(where: { $0.shift == 0 })?.error
+        else {
+            return jointInconclusive("画面无法比较")
+        }
+
+        // A repeated diagonal pattern can appear unique on either conditional
+        // one-axis slice while remaining ambiguous in two dimensions. Include
+        // a joint uniqueness check so such frames fail closed.
+        let globalAlternatives = candidates.filter {
+            abs($0.shift.horizontal - best.shift.horizontal) >= 2
+                || abs($0.shift.vertical - best.shift.vertical) >= 2
+        }
+        let globalAlternativeError = globalAlternatives.map(\.error).min() ?? 1
+        let globalAlternativeSeparation = globalAlternativeError - best.error
+
+        return GimbalMotionVectorEstimate(
+            horizontal: classifyJointAxis(
+                shift: best.shift.horizontal,
+                conditionalZeroError: horizontalZeroError,
+                bestError: best.error,
+                candidates: horizontalCandidates,
+                globalAlternativeSeparation: globalAlternativeSeparation
+            ),
+            vertical: classifyJointAxis(
+                shift: best.shift.vertical,
+                conditionalZeroError: verticalZeroError,
+                bestError: best.error,
+                candidates: verticalCandidates,
+                globalAlternativeSeparation: globalAlternativeSeparation
+            )
+        )
+    }
+
+    private static func isConclusive(_ estimate: GimbalMotionEstimate) -> Bool {
+        switch estimate.verdict {
+        case .moved, .noResponse:
+            return true
+        case .inconclusive:
+            return false
+        }
+    }
+
+    private static func bidirectionallyValidated(
+        forward: GimbalMotionEstimate,
+        reverse: GimbalMotionEstimate
+    ) -> GimbalMotionEstimate? {
+        switch (forward.verdict, reverse.verdict) {
+        case (.moved, .moved):
+            guard forward.axisShift != 0,
+                  reverse.axisShift != 0,
+                  (forward.axisShift > 0) != (reverse.axisShift > 0),
+                  abs(abs(forward.axisShift) - abs(reverse.axisShift)) <= 1
+            else { return nil }
+        case (.noResponse, .noResponse):
+            guard abs(forward.axisShift) <= 1,
+                  abs(reverse.axisShift) <= 1,
+                  abs(forward.axisShift + reverse.axisShift) <= 1
+            else { return nil }
+        case (.moved, .noResponse),
+             (.moved, .inconclusive),
+             (.noResponse, .moved),
+             (.noResponse, .inconclusive),
+             (.inconclusive, _):
+            return nil
+        }
+
+        return GimbalMotionEstimate(
+            axisShift: forward.axisShift,
+            zeroError: max(forward.zeroError, reverse.zeroError),
+            bestError: max(forward.bestError, reverse.bestError),
+            confidence: min(forward.confidence, reverse.confidence),
+            verdict: forward.verdict
+        )
+    }
+
+    private static func bestCandidate(
+        in evaluated: [TranslationShift: Double]
+    ) -> TranslationCandidate? {
+        evaluated.map {
+            TranslationCandidate(shift: $0.key, error: $0.value)
+        }.min(by: candidatePrecedes)
+    }
+
+    private static func candidatePrecedes(
+        _ lhs: TranslationCandidate,
+        _ rhs: TranslationCandidate
+    ) -> Bool {
+        if lhs.error != rhs.error {
+            return lhs.error < rhs.error
+        }
+        let lhsDistance = abs(lhs.shift.horizontal) + abs(lhs.shift.vertical)
+        let rhsDistance = abs(rhs.shift.horizontal) + abs(rhs.shift.vertical)
+        if lhsDistance == rhsDistance {
+            if lhs.shift.vertical == rhs.shift.vertical {
+                return lhs.shift.horizontal < rhs.shift.horizontal
+            }
+            return lhs.shift.vertical < rhs.shift.vertical
+        }
+        return lhsDistance < rhsDistance
+    }
+
+    private static func classifyJointAxis(
+        shift: Int,
+        conditionalZeroError: Double,
+        bestError: Double,
+        candidates: [(shift: Int, error: Double)],
+        globalAlternativeSeparation: Double
+    ) -> GimbalMotionEstimate {
+        guard bestError <= maximumMotionResidual else {
+            return GimbalMotionEstimate(
+                axisShift: shift,
+                zeroError: conditionalZeroError,
+                bestError: bestError,
+                confidence: 0,
+                verdict: .inconclusive("画面残差过高")
+            )
+        }
+
+        let alternatives = candidates.filter { abs($0.shift - shift) >= 2 }
+        let alternativeError = alternatives.map(\.error).min() ?? 1
+        let axisAlternativeSeparation = alternativeError - bestError
+        let effectiveAlternativeSeparation = min(
+            axisAlternativeSeparation,
+            globalAlternativeSeparation
+        )
+        let uniqueness = clamp01(
+            effectiveAlternativeSeparation
+                / max(alternativeError, minimumAlternativeSeparation)
+        )
+
+        if abs(shift) <= 1 {
+            guard conditionalZeroError <= noResponseError else {
+                return GimbalMotionEstimate(
+                    axisShift: shift,
+                    zeroError: conditionalZeroError,
+                    bestError: bestError,
+                    confidence: 0,
+                    verdict: .inconclusive("轴向静止证据不足")
+                )
+            }
+            guard effectiveAlternativeSeparation >= minimumAlternativeSeparation else {
+                return GimbalMotionEstimate(
+                    axisShift: shift,
+                    zeroError: conditionalZeroError,
+                    bestError: bestError,
+                    confidence: uniqueness,
+                    verdict: .inconclusive("轴向静止匹配不唯一")
+                )
+            }
+            let residualQuality = clamp01(1 - conditionalZeroError / noResponseError)
+            return GimbalMotionEstimate(
+                axisShift: shift,
+                zeroError: conditionalZeroError,
+                bestError: bestError,
+                confidence: clamp01(0.75 * residualQuality + 0.25 * uniqueness),
+                verdict: .noResponse
+            )
+        }
+
+        let absoluteImprovement = conditionalZeroError - bestError
+        let relativeImprovement = absoluteImprovement / max(conditionalZeroError, 0.000_001)
+        let residualQuality = clamp01(1 - bestError / maximumMotionResidual)
+        let confidence = clamp01(
+            0.55 * relativeImprovement
+                + 0.25 * residualQuality
+                + 0.20 * uniqueness
+        )
+
+        guard abs(shift) >= minimumMovedShift,
+              absoluteImprovement >= minimumAbsoluteImprovement,
+              relativeImprovement >= minimumRelativeImprovement
+        else {
+            return GimbalMotionEstimate(
+                axisShift: shift,
+                zeroError: conditionalZeroError,
+                bestError: bestError,
+                confidence: confidence,
+                verdict: .inconclusive("轴向位移证据不足")
+            )
+        }
+
+        guard effectiveAlternativeSeparation >= minimumAlternativeSeparation else {
+            return GimbalMotionEstimate(
+                axisShift: shift,
+                zeroError: conditionalZeroError,
+                bestError: bestError,
+                confidence: confidence,
+                verdict: .inconclusive("位移方向不唯一")
+            )
+        }
+
+        return GimbalMotionEstimate(
+            axisShift: shift,
+            zeroError: conditionalZeroError,
+            bestError: bestError,
+            confidence: confidence,
+            verdict: .moved
+        )
+    }
+
     private static func downsampleBiPlanarLuma(
         _ pixelBuffer: CVPixelBuffer,
         targetWidth: Int,
@@ -366,18 +708,32 @@ enum GimbalMotionAnalysis {
         axis: GimbalMotionAxis,
         shift: Int
     ) -> Double {
-        let xStart = axis == .horizontal ? max(0, -shift) : 0
-        let xEnd = axis == .horizontal ? min(reference.width, reference.width - shift) : reference.width
-        let yStart = axis == .vertical ? max(0, -shift) : 0
-        let yEnd = axis == .vertical ? min(reference.height, reference.height - shift) : reference.height
+        compensatedError(
+            reference: reference,
+            current: current,
+            horizontalShift: axis == .horizontal ? shift : 0,
+            verticalShift: axis == .vertical ? shift : 0
+        )
+    }
+
+    private static func compensatedError(
+        reference: GimbalMotionSignature,
+        current: GimbalMotionSignature,
+        horizontalShift: Int,
+        verticalShift: Int
+    ) -> Double {
+        let xStart = max(0, -horizontalShift)
+        let xEnd = min(reference.width, reference.width - horizontalShift)
+        let yStart = max(0, -verticalShift)
+        let yEnd = min(reference.height, reference.height - verticalShift)
         guard xStart < xEnd, yStart < yEnd else { return 1 }
 
         var differenceTotal = 0
         var sampleCount = 0
         for y in yStart..<yEnd {
             for x in xStart..<xEnd {
-                let currentX = axis == .horizontal ? x + shift : x
-                let currentY = axis == .vertical ? y + shift : y
+                let currentX = x + horizontalShift
+                let currentY = y + verticalShift
                 let referenceValue = Int(reference.luma[y * reference.width + x])
                 let currentValue = Int(current.luma[currentY * current.width + currentX])
                 differenceTotal += currentValue - referenceValue
@@ -390,8 +746,59 @@ enum GimbalMotionAnalysis {
         var residualTotal = 0.0
         for y in yStart..<yEnd {
             for x in xStart..<xEnd {
-                let currentX = axis == .horizontal ? x + shift : x
-                let currentY = axis == .vertical ? y + shift : y
+                let currentX = x + horizontalShift
+                let currentY = y + verticalShift
+                let referenceValue = Double(reference.luma[y * reference.width + x])
+                let currentValue = Double(current.luma[currentY * current.width + currentX])
+                residualTotal += abs((currentValue - referenceValue) - brightnessOffset)
+            }
+        }
+        return residualTotal / Double(sampleCount) / 255.0
+    }
+
+    /// Scores every joint translation candidate on the exact same reference
+    /// pixels. Candidate-specific overlap can hide an edge obstruction only at
+    /// a non-zero shift and manufacture a unique false motion match.
+    private static func compensatedErrorOnCommonROI(
+        reference: GimbalMotionSignature,
+        current: GimbalMotionSignature,
+        horizontalShift: Int,
+        verticalShift: Int,
+        horizontalMargin: Int,
+        verticalMargin: Int
+    ) -> Double {
+        let xStart = horizontalMargin
+        let xEnd = reference.width - horizontalMargin
+        let yStart = verticalMargin
+        let yEnd = reference.height - verticalMargin
+        guard xStart < xEnd,
+              yStart < yEnd,
+              xStart + horizontalShift >= 0,
+              xEnd - 1 + horizontalShift < current.width,
+              yStart + verticalShift >= 0,
+              yEnd - 1 + verticalShift < current.height
+        else { return 1 }
+
+        var differenceTotal = 0
+        var sampleCount = 0
+        for y in yStart..<yEnd {
+            for x in xStart..<xEnd {
+                let currentX = x + horizontalShift
+                let currentY = y + verticalShift
+                let referenceValue = Int(reference.luma[y * reference.width + x])
+                let currentValue = Int(current.luma[currentY * current.width + currentX])
+                differenceTotal += currentValue - referenceValue
+                sampleCount += 1
+            }
+        }
+        guard sampleCount > 0 else { return 1 }
+        let brightnessOffset = Double(differenceTotal) / Double(sampleCount)
+
+        var residualTotal = 0.0
+        for y in yStart..<yEnd {
+            for x in xStart..<xEnd {
+                let currentX = x + horizontalShift
+                let currentY = y + verticalShift
                 let referenceValue = Double(reference.luma[y * reference.width + x])
                 let currentValue = Double(current.luma[currentY * current.width + currentX])
                 residualTotal += abs((currentValue - referenceValue) - brightnessOffset)
@@ -410,7 +817,191 @@ enum GimbalMotionAnalysis {
         )
     }
 
+    private static func jointInconclusive(_ reason: String) -> GimbalMotionVectorEstimate {
+        let estimate = inconclusive(reason)
+        return GimbalMotionVectorEstimate(horizontal: estimate, vertical: estimate)
+    }
+
     private static func clamp01(_ value: Double) -> Double {
         min(1, max(0, value))
+    }
+}
+
+enum GimbalCalibrationProbeDisposition: Equatable, Sendable {
+    /// Both axes were still before any motion command was sent.
+    case proceedToCommand
+    /// No command was sent, so retrying cannot compound an unknown pose.
+    case retryBeforeCommand
+    /// The commanded-axis motion was verified and is ready for the operator's
+    /// normal safety-margin decision.
+    case awaitMovedStepConfirmation
+    /// Neither axis showed motion after the command. Only the operator may
+    /// confirm that the physical gimbal truly did not move before returning
+    /// along the previously verified path.
+    case awaitPhysicalNoMovementConfirmation
+    /// A command was sent and the resulting pose cannot be reconstructed from
+    /// the verified-step ledger. Automatic retry/return is therefore unsafe.
+    case abortForUnknownPose
+}
+
+/// Pure fail-closed policy shared by the coordinator and regression tests.
+/// A retry is only possible before a command has been sent. After a command,
+/// anything except a clean same-axis move or a two-axis no-response requires
+/// either an explicit physical no-movement confirmation or a full abort.
+enum GimbalRangeCalibrationSafetyPolicy {
+    static func disposition(
+        commandWasSent: Bool,
+        primaryVerdict: GimbalMotionVerdict,
+        orthogonalVerdict: GimbalMotionVerdict,
+        reversesAcceptedDirection: Bool = false,
+        shiftBelowExpected: Bool = false
+    ) -> GimbalCalibrationProbeDisposition {
+        guard commandWasSent else {
+            if case .noResponse = primaryVerdict,
+               case .noResponse = orthogonalVerdict {
+                return .proceedToCommand
+            }
+            return .retryBeforeCommand
+        }
+
+        switch primaryVerdict {
+        case .moved:
+            guard case .noResponse = orthogonalVerdict,
+                  !reversesAcceptedDirection,
+                  !shiftBelowExpected
+            else { return .abortForUnknownPose }
+            return .awaitMovedStepConfirmation
+        case .noResponse:
+            guard case .noResponse = orthogonalVerdict else {
+                return .abortForUnknownPose
+            }
+            return .awaitPhysicalNoMovementConfirmation
+        case .inconclusive:
+            return .abortForUnknownPose
+        }
+    }
+}
+
+enum GimbalCalibrationPostCommandAutomationAction: Equatable, Sendable {
+    case acceptMovedStep
+    case requestNoMovementConfirmation
+    case resampleObservation
+    case pauseForManualRecovery
+}
+
+/// Pure policy that reduces nuisance interaction without ever resubmitting an
+/// already queued probe. Geometric conflicts remain manual recovery events;
+/// only transient visual uncertainty may consume the bounded resample budget.
+enum GimbalRangeCalibrationAutomationPolicy {
+    static let maximumObservationAttempts = 3
+
+    static func postCommandAction(
+        disposition: GimbalCalibrationProbeDisposition,
+        transientVisualUncertainty: Bool,
+        observationAttempt: Int,
+        maximumObservationAttempts: Int = GimbalRangeCalibrationAutomationPolicy
+            .maximumObservationAttempts
+    ) -> GimbalCalibrationPostCommandAutomationAction {
+        switch disposition {
+        case .awaitMovedStepConfirmation:
+            return .acceptMovedStep
+        case .awaitPhysicalNoMovementConfirmation:
+            return .requestNoMovementConfirmation
+        case .abortForUnknownPose:
+            guard observationAttempt >= 1,
+                  transientVisualUncertainty,
+                  observationAttempt < maximumObservationAttempts
+            else { return .pauseForManualRecovery }
+            return .resampleObservation
+        case .proceedToCommand, .retryBeforeCommand:
+            return .pauseForManualRecovery
+        }
+    }
+
+    static func isTransientVisualUncertainty(
+        primaryVerdict: GimbalMotionVerdict,
+        orthogonalVerdict: GimbalMotionVerdict,
+        reversesAcceptedDirection: Bool,
+        shiftBelowExpected: Bool
+    ) -> Bool {
+        guard !reversesAcceptedDirection, !shiftBelowExpected else { return false }
+        if case .moved = orthogonalVerdict {
+            return false
+        }
+        if case .inconclusive = primaryVerdict {
+            return true
+        }
+        if case .inconclusive = orthogonalVerdict {
+            return true
+        }
+        return false
+    }
+}
+
+/// Stricter evidence gate used only for unattended transitions. The ordinary
+/// verdict remains useful for operator-assisted decisions, but automatic
+/// ledger changes require high confidence, low residual, room inside the
+/// registration search boundary, and a second consistent observation.
+enum GimbalRangeCalibrationAutomaticEvidencePolicy {
+    static let minimumConfidence = 0.65
+    static let maximumMovedResidual = 0.06
+    static let maximumStationaryResidual = 0.025
+
+    static func isReliableStationary(_ estimate: GimbalMotionEstimate) -> Bool {
+        guard case .noResponse = estimate.verdict else { return false }
+        return estimate.confidence >= minimumConfidence
+            && estimate.zeroError <= maximumStationaryResidual
+            && estimate.bestError <= maximumStationaryResidual
+            && abs(estimate.axisShift) <= 1
+    }
+
+    static func isReliableStationary(_ estimate: GimbalMotionVectorEstimate) -> Bool {
+        isReliableStationary(estimate.horizontal)
+            && isReliableStationary(estimate.vertical)
+    }
+
+    static func isReliableMoved(
+        primary: GimbalMotionEstimate,
+        orthogonal: GimbalMotionEstimate,
+        axis: GimbalMotionAxis
+    ) -> Bool {
+        guard case .moved = primary.verdict,
+              isReliableStationary(orthogonal)
+        else { return false }
+        // The 128×72 calibration signature searches ±32 horizontally and
+        // ±18 vertically. Keep a two-pixel margin from either boundary so a
+        // saturated fit can never authorize unattended bookkeeping.
+        let maximumReliableShift = axis == .horizontal ? 30 : 16
+        return primary.confidence >= minimumConfidence
+            && primary.bestError <= maximumMovedResidual
+            && abs(primary.axisShift) >= 2
+            && abs(primary.axisShift) <= maximumReliableShift
+    }
+
+    static func movedObservationsAreConsistent(
+        _ first: GimbalMotionEstimate,
+        _ second: GimbalMotionEstimate
+    ) -> Bool {
+        guard first.axisShift != 0, second.axisShift != 0 else { return false }
+        return (first.axisShift > 0) == (second.axisShift > 0)
+            && abs(first.axisShift - second.axisShift) <= 1
+    }
+}
+
+enum GimbalRangeCalibrationRecoveryAction: Equatable, Sendable {
+    case pauseForManualRecovery
+    case terminate
+}
+
+enum GimbalRangeCalibrationRecoveryPolicy {
+    /// Unknown post-command motion can remain inside the current calibration
+    /// lease only after a STOP was accepted and both leases are still valid.
+    /// Otherwise there is no safe way to promise that another command cannot
+    /// be issued, so the entire calibration must terminate fail-closed.
+    static func action(
+        stopAccepted: Bool,
+        sessionsAreValid: Bool
+    ) -> GimbalRangeCalibrationRecoveryAction {
+        stopAccepted && sessionsAreValid ? .pauseForManualRecovery : .terminate
     }
 }

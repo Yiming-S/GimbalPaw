@@ -64,14 +64,17 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
+                let calibrationWasRunning = calibration.isRunning
                 let hadActiveMotion = tracking.enabled
-                    || calibration.isRunning
+                    || calibrationWasRunning
                     || bluetooth.motionSafetyArmed
                 tracking.setAppActive(false, sendStopOnDisable: false)
                 calibration.setAppActive(false, sendStopOnDisable: false)
                 bluetooth.bestEffortStopWhenAppBecomesInactive()
                 if hadActiveMotion {
-                    autoStopNotice = "应用失去焦点时已自动停止运动并锁定安全确认；返回后请检查云台姿态，再重新打开安全确认。"
+                    autoStopNotice = calibrationWasRunning
+                        ? "应用失去焦点时已 STOP 并锁定安全确认；已完成方向仍保留。返回后请人工回正、重新打开安全确认，再继续当前方向。"
+                        : "应用失去焦点时已自动停止运动并锁定安全确认；返回后请检查云台姿态，再重新打开安全确认。"
                 }
             } else {
                 tracking.setAppActive(true)
@@ -114,7 +117,7 @@ struct ContentView: View {
                         .background(.orange.opacity(0.18), in: Capsule())
                         .foregroundStyle(.orange)
                 }
-                Text("Apple Silicon 原生 · BLE 云台控制 · USB 摄像头预览")
+                Text("Apple Silicon 原生 · BLE 云台控制 · iPhone / 外置摄像头预览")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -140,7 +143,7 @@ private struct CameraPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("USB 摄像头", systemImage: "video.fill")
+                Label("摄像头", systemImage: "video.fill")
                     .font(.headline)
                 Spacer()
                 TrackingStateBadge(tracking: tracking)
@@ -197,9 +200,9 @@ private struct CameraPanel: View {
         case .denied:
             return "请允许 OM3 Lab 使用摄像头，然后返回应用刷新设备列表。"
         case .error:
-            return "请检查 USB 连接与占用该摄像头的其他应用，然后重新启动预览。"
+            return "请确认 iPhone 连续互通相机可用，或检查外置摄像头连接与占用它的其他应用，然后重新启动预览。"
         default:
-            return "摄像头 USB 线直接连接 Mac mini；OM3 不传输画面。"
+            return "画面来自所选 iPhone Camera 或外置摄像头；OM3 本身不向 Mac 传输画面。"
         }
     }
 }
@@ -250,15 +253,15 @@ private struct TrackingCameraPreview: View {
     }
 
     private var accessibilityLabel: String {
-        guard tracking.enabled else { return "USB 摄像头实时预览" }
+        guard tracking.enabled else { return "所选摄像头实时预览" }
         let count = tracking.visiblePeople.count
         if let selected = tracking.selectedPersonID {
             let visibility = tracking.selectedPersonDetection == nil
                 ? "未可靠关联"
                 : "画面内"
-            return "USB 摄像头实时预览，检测到 \(count) 人，已锁定\(selected.title)，\(visibility)"
+            return "所选摄像头实时预览，检测到 \(count) 人，已锁定\(selected.title)，\(visibility)"
         }
-        return "USB 摄像头实时预览，检测到 \(count) 人，尚未锁定目标"
+        return "所选摄像头实时预览，检测到 \(count) 人，尚未锁定目标"
     }
 }
 
@@ -338,10 +341,15 @@ private struct CameraControlsRow: View {
     @ObservedObject var tracking: PersonTrackingCoordinator
     @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
 
-    /// Switching or stopping the camera silently kills the tracking or
-    /// calibration session, so these controls lock while one is running.
-    private var controlsLocked: Bool {
+    /// Device switching stays locked for the entire tracking/calibration
+    /// lease. During an explicit calibration recovery pause, restarting or
+    /// refreshing the same remembered camera is safe and must remain possible.
+    private var selectionLocked: Bool {
         tracking.enabled || calibration.isRunning
+    }
+
+    private var previewActionsLocked: Bool {
+        tracking.enabled || (calibration.isRunning && !calibration.manualRecoveryPaused)
     }
 
     var body: some View {
@@ -372,13 +380,13 @@ private struct CameraControlsRow: View {
                     }
                 }
                 .frame(maxWidth: 310)
-                .disabled(controlsLocked)
+                .disabled(selectionLocked)
 
                 Button(camera.status.isRunning ? "重新启动" : "开始预览") {
                     camera.startSelectedOrFirst()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(controlsLocked)
+                .disabled(previewActionsLocked)
             }
 
             Button {
@@ -386,17 +394,21 @@ private struct CameraControlsRow: View {
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
-            .help("刷新外置摄像头列表")
-            .accessibilityLabel("刷新外置摄像头列表")
-            .disabled(controlsLocked)
+            .help("刷新摄像头列表")
+            .accessibilityLabel("刷新摄像头列表")
+            .disabled(previewActionsLocked)
 
             Button("停止") {
                 camera.stop()
             }
-            .disabled(!camera.status.isRunning || controlsLocked)
+            .disabled(!camera.status.isRunning || previewActionsLocked)
 
-            if controlsLocked {
-                Text("跟踪/验证运行中，摄像头切换已锁定")
+            if selectionLocked {
+                Text(
+                    calibration.manualRecoveryPaused
+                        ? "验证已暂停：可重启/刷新当前摄像头，设备切换仍锁定"
+                        : "跟踪/验证运行中，摄像头切换已锁定"
+                )
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -468,7 +480,7 @@ private struct ControlPanel: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("请先把 OM3 人工置于居中起点，确认负载配平、摄像头刚性固定、软线在左右上下全程都有余量，周围无人和障碍物，并把手放在电源开关附近。左右每步 5°、最多验证 100°；上下每步 2°、最多验证 36°，每一步都会暂停等待确认。")
+            Text("请先把 OM3 人工置于居中起点，确认负载配平、摄像头刚性固定、软线在左右上下全程都有余量，周围无人和障碍物，并把手放在电源开关附近。DJI 手册中的 Pan -162.5°～170.3°、Tilt -104.5°～235.7°是结构范围，不是本次安装可直接使用的对称控制范围；App 会分别验证左、右、上、下并保留端点余量。运行中可随时按 STOP。")
         }
     }
 
@@ -630,7 +642,11 @@ private struct ControlPanel: View {
                         .padding(.vertical, 3)
                         .background(.green.opacity(0.12), in: Capsule())
                 } else if calibration.isRunning {
-                    Text("独占控制")
+                    Text(
+                        calibration.manualRecoveryPaused
+                            ? "安全暂停 · 已保留进度"
+                            : "自动连续 · 独占控制"
+                    )
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.orange)
                         .padding(.horizontal, 7)
@@ -646,6 +662,10 @@ private struct ControlPanel: View {
             Text(calibration.detailText)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+
+            Label(activeRangeText, systemImage: "move.3d")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(calibration.envelopeIsActive ? .green : .cyan)
 
             if calibration.isRunning {
                 ProgressView(value: calibration.progress)
@@ -708,14 +728,28 @@ private struct ControlPanel: View {
                 }
             }
 
-            if calibration.awaitingStepDecision {
+            if calibration.manualRecoveryPaused {
+                HStack(spacing: 8) {
+                    Button("我已人工回正，重试当前方向") {
+                        calibration.confirmManualRecoveryAndRetryCurrentDirection()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .help("清空当前方向的未知位移账本，重新取静止基线；已完成方向会保留")
+
+                    Button("结束验证") {
+                        calibration.cancel()
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .controlSize(.small)
+            } else if calibration.awaitingStepDecision {
                 HStack(spacing: 8) {
                     if calibration.canContinueOutward {
                         Button(confirmedDirectionButtonTitle) {
                             calibration.confirmObservedStepAndContinue()
                         }
                         .buttonStyle(.borderedProminent)
-                    } else {
+                    } else if calibration.canRetryCurrentStep {
                         Button("重试本步") {
                             calibration.retryCurrentStep()
                         }
@@ -726,11 +760,18 @@ private struct ControlPanel: View {
                     Button(
                         calibration.canContinueOutward
                             ? "这里作为安全端点"
-                            : "确认疑似端点并返程"
+                            : calibration.requiresNoMovementConfirmation
+                                ? "确认实体未移动，按原路返程"
+                                : "按已确认路径返程"
                     ) {
                         calibration.stopAtCurrentSafeExtent()
                     }
                     .buttonStyle(.bordered)
+                    .help(
+                        calibration.requiresNoMovementConfirmation
+                            ? "只有现场确认刚才的探测动作完全没有造成实体位移，才可使用此前已验证的步数自动返程"
+                            : "结束当前方向，并按此前已确认的动作路径返程"
+                    )
 
                     Button("取消") {
                         calibration.cancel()
@@ -772,14 +813,14 @@ private struct ControlPanel: View {
                 .disabled(!calibration.canStart)
 
                 if !calibration.canStart {
-                    Text("需先启动 USB 摄像头、连接 OM3、开启运动安全确认，并关闭人物跟踪。")
+                    Text("需先启动所选摄像头、连接 OM3、开启运动安全确认，并关闭人物跟踪。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
 
             Label(
-                "这是当前安装与线缆条件下的人工安全范围，不是机械限位；画面无响应也可能是阻塞或 BLE 未执行。",
+                "官方结构范围只用于异常上限；当前安装的实测四向范围才是跟踪硬边界。换载荷、理线、横竖屏或握持姿态后请重新验证。",
                 systemImage: "exclamationmark.shield"
             )
             .font(.caption2)
@@ -831,6 +872,18 @@ private struct ControlPanel: View {
                 }
             }
         }
+    }
+
+    private var activeRangeText: String {
+        if let envelope = bluetooth.calibratedTrackingEnvelope {
+            return "已绑定实测硬边界：左 \(degreeText(envelope.leftYawTenths))° · 右 \(degreeText(envelope.rightYawTenths))° · 上 \(degreeText(envelope.upPitchTenths))° · 下 \(degreeText(envelope.downPitchTenths))°"
+        }
+        let fallback = OM3HardwareMotionLimits.centeredFallbackEnvelopeDegrees
+        return "未标定回中硬边界：左/右各 \(fallback.left)° · 上/下各 \(fallback.up)°；全向验证后按四个方向分别扩大"
+    }
+
+    private func degreeText(_ tenths: Int) -> String {
+        String(format: "%.1f", Double(tenths) / 10.0)
     }
 
     private var safetyStatusText: String {
@@ -935,13 +988,14 @@ private struct TrackingSection: View {
             }
 
             if let detection = tracking.selectedPersonDetection, tracking.enabled {
+                let headAnchorY = PersonTrackingPolicy.headAnchorY(for: detection)
                 HStack(spacing: 12) {
                     Label(
                         "置信度 \(Int(detection.confidence * 100))%",
                         systemImage: "person.crop.rectangle"
                     )
                     Text(
-                        "X \(signedPercent(detection.centerX - 0.5)) · Y \(signedPercent(detection.centerY - 0.5))"
+                        "X误差 \(signedPercent(detection.centerX - 0.5)) · 头部锚点 Y \(normalizedPercent(headAnchorY)) · 目标 Y 32% · Pitch误差 \(signedPercent(headAnchorY - PersonTrackingPolicy.verticalHeadAnchorTarget))"
                     )
                     .monospacedDigit()
                 }
@@ -989,7 +1043,14 @@ private struct TrackingSection: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-                if tracking.speedMode == .fast {
+                if tracking.speedMode == .turbo50x {
+                    Label(
+                        "50× 是目标响应倍率；Yaw 与 Pitch 合成命令按 OM3 官方最大 120°/s 封顶（0.1 秒最多 12.0°）。硬包络、累计行程、反向 STOP 与丢帧保护仍生效。",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                } else if tracking.speedMode == .fast {
                     Label(
                         "连续极速约为上一版极速档的 3 倍；动作之间无额外等待，请务必先空载测试并给软线留足余量。",
                         systemImage: "exclamationmark.triangle.fill"
@@ -1000,8 +1061,8 @@ private struct TrackingSection: View {
 
                 if tracking.enabled {
                     Label(
-                        "人物出框后会先沿离场方向寻找，再在 ±20° 软件范围内自动扫描。",
-                        systemImage: "arrow.left.and.right"
+                        "人物出框后先沿真实离场方向惯性寻找，再在当前安全包络内进行左右上下四向扩张扫描。",
+                        systemImage: "arrow.up.left.and.arrow.down.right"
                     )
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -1121,6 +1182,10 @@ private struct TrackingSection: View {
         String(format: "%+.0f%%", value * 100)
     }
 
+    private func normalizedPercent(_ value: Double) -> String {
+        String(format: "%.0f%%", value * 100)
+    }
+
     private var personCountText: String {
         guard tracking.hasAnalyzedPeopleFrame else { return "正在分析人物…" }
         return "检测到 \(tracking.visiblePeople.count) 个可跟踪人物"
@@ -1155,7 +1220,7 @@ private struct TrackingSection: View {
             return "人物分析仍在运行；确认线缆安全后可继续下一轮扫描。"
         }
         if tracking.enabled {
-            return "请让目标人物进入画面；出框后会自动惯性寻找并左右扫描。"
+            return "请让目标人物进入画面；可见时同时修正左右与上下，出框后会按离场方向惯性寻找并做二维扫描。"
         }
         if bluetooth.motionSafetyArmed, !bluetooth.trackingOriginConfirmed {
             return "当前原点已因点动或 STOP 失效；请人工回正，关闭并重新打开运动安全确认。"
@@ -1321,7 +1386,7 @@ private struct WiringStrip: View {
             Label("Mac mini", systemImage: "macmini")
             Image(systemName: "arrow.right")
                 .foregroundStyle(.secondary)
-            Label("USB 摄像头", systemImage: "cable.connector")
+            Label("摄像头", systemImage: "video.fill")
             Spacer()
             Text("OM3 USB → 充电器（可选）")
         }

@@ -42,6 +42,7 @@ fi
     -module-cache-path "$module_cache" \
     -module-name OM3ProtocolSelfTest \
     "$project_dir/Sources/OM3Lab/OM3Protocol.swift" \
+    "$project_dir/Sources/OM3Lab/OM3HardwareMotionLimits.swift" \
     "$project_dir/Sources/OM3Lab/PersonTracking.swift" \
     "$project_dir/Sources/OM3Lab/GimbalMotionAnalysis.swift" \
     "$project_dir/Tests/ProtocolSelfTest/main.swift" \

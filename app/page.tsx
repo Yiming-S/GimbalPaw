@@ -5,7 +5,6 @@ import Skeleton from "react-loading-skeleton";
 import "react-loading-skeleton/dist/skeleton.css";
 import {
   buildRotationMessage,
-  TEST_DURATION_TENTHS,
   TEST_STEP_DEGREES,
   toHex,
 } from "./om3-protocol";

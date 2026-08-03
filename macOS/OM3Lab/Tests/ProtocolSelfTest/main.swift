@@ -64,6 +64,41 @@ do {
         "golden STOP frame mismatch"
     )
 
+    expect(
+        OM3HardwareMotionLimits.structuralCeilingDegrees
+            == OM3HardwareMotionLimits.DirectionalDegrees(
+                left: 162.5,
+                right: 170.3,
+                up: 104.5,
+                down: 235.7
+            ),
+        "DJI OM3 published structural ranges must remain the outer sanity authority"
+    )
+    expect(
+        OM3HardwareMotionLimits.probeCapsDegrees
+            == OM3HardwareMotionLimits.DirectionalWholeDegrees(
+                left: 150,
+                right: 160,
+                up: 98,
+                down: 228
+            ),
+        "four-direction calibration probe caps mismatch"
+    )
+    expect(
+        GimbalTrackingEnvelope.conservativeDefault
+            == GimbalTrackingEnvelope(
+                leftYawTenths: 1_200,
+                rightYawTenths: 1_200,
+                upPitchTenths: 600,
+                downPitchTenths: 600
+            ),
+        "un-calibrated centered envelope must no longer use the old 45° / 15° limits"
+    )
+    expect(
+        OM3HardwareMotionLimits.maximumCombinedCommandTenths(durationTenths: 1) == 120,
+        "a 0.1-second OM3 command must be capped at 12 degrees"
+    )
+
     let tracking = try OM3Protocol.relativeMove(
         yawTenths: 5,
         pitchTenths: -5,
@@ -75,6 +110,23 @@ do {
     expect(tracking[15] == 0xfb && tracking[16] == 0xff, "tracking pitch encoding mismatch")
     expect(tracking[18] == 0x01, "tracking duration must be 0.1 seconds")
 
+    for (direction, expectedPitch) in [
+        (PersonSearchDirection.up, -PersonSearchPolicy.scanStepTenths),
+        (PersonSearchDirection.down, PersonSearchPolicy.scanStepTenths),
+    ] {
+        let correction = PersonSearchPolicy.requestedStep(direction: direction, mode: .scan)
+        let frame = try OM3Protocol.relativeMove(
+            yawTenths: correction.yawTenths,
+            pitchTenths: correction.pitchTenths,
+            durationTenths: PersonSearchPolicy.scanDurationTenths
+        )
+        expect(correction.pitchTenths == expectedPitch, "vertical scan correction sign mismatch")
+        expect(frame[11] == 0 && frame[12] == 0, "vertical scan must keep yaw at zero")
+        let encodedPitch = Int16(bitPattern: UInt16(frame[15]) | UInt16(frame[16]) << 8)
+        expect(Int(encodedPitch) == expectedPitch, "vertical scan BLE pitch encoding mismatch")
+        expect(frame[18] == PersonSearchPolicy.scanDurationTenths, "scan duration mismatch")
+    }
+
     let centered = PersonDetection(
         x: 0.4,
         y: 0.3,
@@ -83,6 +135,35 @@ do {
         confidence: 0.9
     )
     expect(PersonTrackingPolicy.correction(for: centered) == nil, "dead-zone must suppress motion")
+    expect(
+        PersonTrackingPolicy.verticalDeadZone == 0.08
+            && PersonTrackingPolicy.verticalInnerDeadZone == 0.04,
+        "Pitch hysteresis must remain tighter than the old hidden vertical band"
+    )
+    let ordinaryDown = PersonDetection(
+        x: 0.4,
+        y: 0.31,
+        width: 0.2,
+        height: 0.4,
+        confidence: 0.9
+    )
+    expect(
+        PersonTrackingPolicy.correction(for: ordinaryDown)?.pitchTenths ?? 0 > 0,
+        "an ordinary downward head-anchor error must produce positive Pitch"
+    )
+    let pitchReverse = PersonTrackingPolicy.predictiveCorrection(
+        anchorX: 0.5,
+        anchorY: 0.60,
+        velocityX: 0,
+        velocityY: 0,
+        centering: .uncentered,
+        previousCorrection: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20),
+        speedMode: .fast
+    )
+    expect(
+        pitchReverse.requiresReversalStop && pitchReverse.correction == nil,
+        "a significant Pitch reversal must require STOP"
+    )
 
     let upperRight = PersonDetection(
         x: 0.7,
@@ -119,6 +200,10 @@ do {
         PersonTrackingPolicy.correction(for: farLeft, speedMode: .fast)?.yawTenths == -65,
         "continuous fast tracking profile must cap yaw at 6.5 degrees"
     )
+    expect(
+        PersonTrackingPolicy.correction(for: farLeft, speedMode: .turbo50x)?.yawTenths == -120,
+        "50x tracking profile must respect the OM3 12-degree-per-0.1-second cap"
+    )
     let fastNearRight = PersonDetection(
         x: 0.55,
         y: 0.3,
@@ -141,6 +226,14 @@ do {
         PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .fast)?.yawTenths == 50,
         "continuous fast tracking must interpolate the medium band"
     )
+    expect(
+        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .turbo50x)?.yawTenths == 47,
+        "50x tracking must scale the near-error proportional waypoint"
+    )
+    expect(
+        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .turbo50x)?.yawTenths == 114,
+        "50x tracking must scale the medium-error proportional waypoint"
+    )
     let previousContinuousMaximumRate = 45.0 / 0.21
     let upgradedMaximumRate = Double(PersonTrackingSpeedMode.fast.yawMaximumTenths)
         / PersonTrackingSpeedMode.fast.commandCooldown
@@ -162,6 +255,131 @@ do {
             <= PersonTrackingSpeedMode.fast.commandCooldown,
         "fast tracking must reject samples older than one command interval"
     )
+    let smoothYawRate = Double(PersonTrackingSpeedMode.smooth.yawMaximumTenths)
+        / PersonTrackingSpeedMode.smooth.commandCooldown
+    let turboYawRate = Double(PersonTrackingSpeedMode.turbo50x.yawMaximumTenths)
+        / PersonTrackingSpeedMode.turbo50x.commandCooldown
+    let smoothPitchRate = Double(PersonTrackingSpeedMode.smooth.pitchMaximumTenths)
+        / PersonTrackingSpeedMode.smooth.commandCooldown
+    let turboPitchRate = Double(PersonTrackingSpeedMode.turbo50x.pitchMaximumTenths)
+        / PersonTrackingSpeedMode.turbo50x.commandCooldown
+    expect(
+        turboYawRate == OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond,
+        "50x yaw must saturate exactly at DJI's published OM3 speed ceiling"
+    )
+    expect(
+        turboYawRate / smoothYawRate > 40.0
+            && turboYawRate / smoothYawRate <= 50.0,
+        "the hardware-capped 50x yaw response must remain above forty times smooth mode"
+    )
+    expect(
+        abs(turboPitchRate / smoothPitchRate - 50.0) <= 0.5,
+        "50x tracking pitch rate must remain approximately fifty times smooth mode"
+    )
+    expect(
+        abs(
+            Double(PersonTrackingSpeedMode.turbo50x.minimumStepTenths)
+                / PersonTrackingSpeedMode.turbo50x.commandCooldown
+                / (Double(PersonTrackingSpeedMode.smooth.minimumStepTenths)
+                    / PersonTrackingSpeedMode.smooth.commandCooldown)
+                - 50.0
+        ) <= 1.5,
+        "50x tracking minimum correction rate must remain near the profile ratio"
+    )
+    expect(
+        abs(
+            Double(PersonTrackingSpeedMode.turbo50x.mediumStepTenths)
+                / PersonTrackingSpeedMode.turbo50x.commandCooldown
+                / (Double(PersonTrackingSpeedMode.smooth.mediumStepTenths)
+                    / PersonTrackingSpeedMode.smooth.commandCooldown)
+                - 50.0
+        ) <= 0.5,
+        "50x tracking medium correction rate must remain near the profile ratio"
+    )
+    expect(
+        PersonTrackingSpeedMode.turbo50x.commandCooldown
+            == Double(PersonTrackingSpeedMode.turbo50x.commandDurationTenths) / 10.0,
+        "50x tracking must add no idle delay after each action"
+    )
+    expect(
+        PersonTrackingSpeedMode.turbo50x.maximumSampleAge
+            <= PersonTrackingSpeedMode.turbo50x.commandCooldown,
+        "50x tracking must reject samples older than one command interval"
+    )
+    let turboGrowth = PersonTrackingPolicy.predictiveCorrection(
+        anchorX: 0.95,
+        anchorY: 0.32,
+        velocityX: 0,
+        velocityY: 0,
+        centering: .uncentered,
+        previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
+        speedMode: .turbo50x
+    )
+    expect(
+        turboGrowth.correction?.yawTenths == 120,
+        "50x tracking must remove the legacy growth bottleneck without exceeding 120°/s"
+    )
+    let turboReverse = PersonTrackingPolicy.predictiveCorrection(
+        anchorX: 0.05,
+        anchorY: 0.32,
+        velocityX: 0,
+        velocityY: 0,
+        centering: .uncentered,
+        previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
+        speedMode: .turbo50x
+    )
+    expect(
+        turboReverse.requiresReversalStop && turboReverse.correction == nil,
+        "50x tracking must retain the major-reversal STOP"
+    )
+    expect(
+        PersonTrackingSpeedMode.smooth.yawTravelBudgetTenths
+            >= OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees.right * 10,
+        "every profile's cumulative yaw fuse must allow reaching a calibrated boundary"
+    )
+    expect(
+        PersonTrackingSpeedMode.smooth.pitchTravelBudgetTenths
+            >= OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees.down * 10,
+        "every profile's cumulative pitch fuse must allow reaching a calibrated boundary"
+    )
+    expect(
+        PersonTrackingTravelBudgetPolicy.allowsCorrection(
+            nextYawTravelTenths: 45_000,
+            nextPitchTravelTenths: 45_000,
+            speedMode: .turbo50x
+        ),
+        "50x correction budget must accept its exact limits"
+    )
+    expect(
+        !PersonTrackingTravelBudgetPolicy.allowsCorrection(
+            nextYawTravelTenths: 45_001,
+            nextPitchTravelTenths: 45_000,
+            speedMode: .turbo50x
+        ),
+        "50x correction budget must reject travel above its yaw limit"
+    )
+    expect(
+        !PersonTrackingTravelBudgetPolicy.allowsSearch(
+            nextYawTravelTenths: 45_001,
+            nextPitchTravelTenths: 0,
+            speedMode: .turbo50x
+        ),
+        "50x search budget must share the same yaw limit"
+    )
+    expect(
+        PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
+            storedProfileVersion: nil
+        ) == PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true),
+        "pre-50x installs must migrate once"
+    )
+    expect(
+        PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
+            storedProfileVersion: 1
+        ) == PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: false),
+        "a post-migration manual smooth choice must persist"
+    )
     expect(
         PersonTrackingPolicy.minimumStopCooldown >= 0.12,
         "STOP must retain a dedicated minimum barrier"
@@ -169,7 +387,7 @@ do {
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: 60, pitchTenths: 0),
-            currentYawTenths: 400,
+            currentYawTenths: 1_150,
             currentPitchTenths: 0
         ) == PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0),
         "an axial continuous step must decelerate exactly into the diamond boundary"
@@ -177,7 +395,7 @@ do {
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: 65, pitchTenths: 0),
-            currentYawTenths: 450,
+            currentYawTenths: 1_200,
             currentPitchTenths: 0
         ) == nil,
         "outward motion at the hard boundary must be rejected"
@@ -185,7 +403,7 @@ do {
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0),
-            currentYawTenths: 450,
+            currentYawTenths: 1_200,
             currentPitchTenths: 0
         ) == PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0),
         "inward motion at the hard boundary must remain available"
@@ -193,7 +411,7 @@ do {
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: -60, pitchTenths: 0),
-            currentYawTenths: -400,
+            currentYawTenths: -1_150,
             currentPitchTenths: 0
         ) == PersonTrackingCorrection(yawTenths: -50, pitchTenths: 0),
         "negative travel must decelerate into the left hard boundary"
@@ -201,76 +419,90 @@ do {
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: 60, pitchTenths: 20),
-            currentYawTenths: 400,
+            currentYawTenths: 1_150,
             currentPitchTenths: 0
-        ) == PersonTrackingCorrection(yawTenths: 25, pitchTenths: 8),
+        ) == PersonTrackingCorrection(yawTenths: 30, pitchTenths: 10),
         "a diagonal step must be clipped along its line into the verified diamond"
     )
     expect(
         PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
             PersonTrackingCorrection(yawTenths: 60, pitchTenths: 20),
-            currentYawTenths: 450,
+            currentYawTenths: 1_200,
             currentPitchTenths: 0
         ) == nil,
         "a diagonal outward step at a cardinal boundary must be rejected"
     )
 
-    expect(PersonSearchDirection.left.rawValue == -1, "left search direction must be -1")
-    expect(PersonSearchDirection.right.rawValue == 1, "right search direction must be 1")
     expect(PersonSearchDirection.left.opposite == .right, "left opposite must be right")
     expect(PersonSearchDirection.right.opposite == .left, "right opposite must be left")
+    expect(PersonSearchDirection.up.opposite == .down, "up opposite must be down")
+    expect(PersonSearchDirection.down.opposite == .up, "down opposite must be up")
     expect(
-        PersonSearchPolicy.coastStepTenths == 10
+        PersonSearchDirection.right.clockwise == .down
+            && PersonSearchDirection.down.clockwise == .left
+            && PersonSearchDirection.left.clockwise == .up
+            && PersonSearchDirection.up.clockwise == .right,
+        "clockwise scan cycle must cover all four directions"
+    )
+    expect(
+        PersonSearchPolicy.coastStepTenths == 20
             && PersonSearchPolicy.coastDurationTenths == 1
             && PersonSearchPolicy.lossGraceStopCooldown == 0.12
-            && PersonSearchPolicy.maximumCoastTravelTenths == 20,
+            && PersonSearchPolicy.maximumCoastTravelTenths == 60,
         "coast policy constants mismatch"
     )
     expect(
-        PersonSearchPolicy.scanSoftYawLimitTenths == 200
-            && PersonSearchPolicy.scanStepTenths == 20
-            && PersonSearchPolicy.maximumScanEpisodeTravelTenths == 600
+        PersonSearchPolicy.scanStepTenths == 50
+            && PersonSearchPolicy.scanDurationTenths == 1
+            && PersonSearchPolicy.maximumScanEpisodeTravelTenths == 30_000
             && PersonSearchPolicy.maximumVisionSilence == 0.50,
         "scan policy bounds mismatch"
     )
+    let rightExit = [
+        PersonSearchObservation(centerX: 0.78, centerY: 0.5, confidence: 0.8),
+        PersonSearchObservation(centerX: 0.83, centerY: 0.5, confidence: 0.8),
+        PersonSearchObservation(centerX: 0.89, centerY: 0.5, confidence: 0.8),
+    ]
     expect(
         PersonSearchPolicy.coastDirection(
-            recentCenterXs: [0.78, 0.83, 0.89],
-            lastConfidence: 0.8,
-            lastYawTenths: 10
+            recentObservations: rightExit,
+            lastCorrection: PersonTrackingCorrection(yawTenths: 10, pitchTenths: 0)
         ) == .right,
         "trusted right-edge motion must enable rightward coasting"
     )
     expect(
         PersonSearchPolicy.coastDirection(
-            recentCenterXs: [0.78, 0.83, 0.89],
-            lastConfidence: 0.8,
-            lastYawTenths: -10
+            recentObservations: rightExit,
+            lastCorrection: PersonTrackingCorrection(yawTenths: -10, pitchTenths: 0)
         ) == nil,
         "coasting must reject a visual and command direction mismatch"
     )
+    let upExit = [
+        PersonSearchObservation(centerX: 0.5, centerY: 0.21, confidence: 0.8),
+        PersonSearchObservation(centerX: 0.5, centerY: 0.16, confidence: 0.8),
+        PersonSearchObservation(centerX: 0.5, centerY: 0.10, confidence: 0.8),
+    ]
     expect(
         PersonSearchPolicy.coastDirection(
-            recentCenterXs: [0.80, 0.86, 0.84, 0.89],
-            lastConfidence: 0.8,
-            lastYawTenths: 10
-        ) == nil,
-        "coasting must reject a non-monotonic exit trajectory"
+            recentObservations: upExit,
+            lastCorrection: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -10)
+        ) == .up,
+        "trusted top-edge motion must enable upward coasting"
     )
     expect(
-        PersonSearchPolicy.scanStep(currentYawTenths: 0, direction: .left)
-            == PersonSearchStep(yawTenths: -20, reachesSoftBoundary: false),
+        PersonSearchPolicy.requestedStep(direction: .left, mode: .scan)
+            == PersonTrackingCorrection(yawTenths: -50, pitchTenths: 0),
         "left scan step mismatch"
     )
     expect(
-        PersonSearchPolicy.scanStep(currentYawTenths: -190, direction: .left)
-            == PersonSearchStep(yawTenths: -10, reachesSoftBoundary: true),
-        "left scan must clamp at its soft boundary"
+        PersonSearchPolicy.requestedStep(direction: .up, mode: .scan)
+            == PersonTrackingCorrection(yawTenths: 0, pitchTenths: -50),
+        "up scan step mismatch"
     )
     expect(
-        PersonSearchPolicy.coastStep(currentYawTenths: 195, direction: .right)
-            == PersonSearchStep(yawTenths: 5, reachesSoftBoundary: true),
-        "coasting must clamp at the scan soft boundary"
+        PersonSearchPolicy.requestedStep(direction: .down, mode: .coast)
+            == PersonTrackingCorrection(yawTenths: 0, pitchTenths: 20),
+        "down coast step mismatch"
     )
     expect(
         abs(
@@ -283,17 +515,11 @@ do {
         "search packet admission must reserve its full action duration"
     )
     expect(
-        PersonSearchPolicy.scanStep(currentYawTenths: -200, direction: .left) == nil,
-        "scan must stop at its selected soft boundary"
-    )
-    expect(
-        PersonSearchPolicy.scanStep(currentYawTenths: 250, direction: .left)
-            == PersonSearchStep(yawTenths: -20, reachesSoftBoundary: false),
-        "out-of-range scan must permit a step toward zero"
-    )
-    expect(
-        PersonSearchPolicy.scanStep(currentYawTenths: 250, direction: .right) == nil,
-        "out-of-range scan must reject motion farther from zero"
+        PersonSearchPolicy.reachesEnvelopeBoundary(
+            requested: PersonTrackingCorrection(yawTenths: 0, pitchTenths: 20),
+            submitted: PersonTrackingCorrection(yawTenths: 0, pitchTenths: 5)
+        ),
+        "a clipped pitch search command must report its envelope boundary"
     )
 
     let identitySessionID = UUID()
@@ -482,6 +708,42 @@ do {
         verticalMotion.axisShift == -4 && verticalMotion.verdict == .moved,
         "camera motion analysis must detect vertical translation"
     )
+    let horizontalJointMotion = GimbalMotionAnalysis.estimateTranslation(
+        reference: referenceMotion,
+        current: shifted(referenceMotion, dx: 12, dy: 0)
+    )
+    expect(
+        horizontalJointMotion.horizontal.axisShift == 12
+            && horizontalJointMotion.horizontal.verdict == .moved,
+        "joint camera motion analysis must detect a large horizontal translation"
+    )
+    expect(
+        horizontalJointMotion.vertical.axisShift == 0
+            && horizontalJointMotion.vertical.verdict == .noResponse,
+        "joint camera motion analysis must compensate horizontal motion before checking vertical response"
+    )
+    let diagonalJointMotion = GimbalMotionAnalysis.estimateTranslation(
+        reference: referenceMotion,
+        current: shifted(referenceMotion, dx: 7, dy: -5)
+    )
+    expect(
+        diagonalJointMotion.horizontal.axisShift == 7
+            && diagonalJointMotion.horizontal.verdict == .moved
+            && diagonalJointMotion.vertical.axisShift == -5
+            && diagonalJointMotion.vertical.verdict == .moved,
+        "coarse-to-fine camera motion analysis must refine odd-pixel diagonal translation"
+    )
+    let boundaryJointMotion = GimbalMotionAnalysis.estimateTranslation(
+        reference: referenceMotion,
+        current: shifted(referenceMotion, dx: 16, dy: -9)
+    )
+    expect(
+        boundaryJointMotion.horizontal.axisShift == 16
+            && boundaryJointMotion.horizontal.verdict == .moved
+            && boundaryJointMotion.vertical.axisShift == -9
+            && boundaryJointMotion.vertical.verdict == .moved,
+        "coarse-to-fine camera motion analysis must include both search boundaries"
+    )
     expect(
         GimbalMotionAnalysis.estimate(
             reference: referenceMotion,
@@ -489,6 +751,15 @@ do {
             axis: .horizontal
         ).verdict == .noResponse,
         "an unchanged textured frame must be classified as no response"
+    )
+    let stationaryJointMotion = GimbalMotionAnalysis.estimateTranslation(
+        reference: referenceMotion,
+        current: referenceMotion
+    )
+    expect(
+        stationaryJointMotion.horizontal.verdict == .noResponse
+            && stationaryJointMotion.vertical.verdict == .noResponse,
+        "a joint unchanged textured frame must be no response on both axes"
     )
     let flatMotion = GimbalMotionSignature(
         width: 64,
@@ -504,7 +775,290 @@ do {
     } else {
         expect(false, "low-texture frame must not be accepted as a boundary response")
     }
-
+    let occlusionWidth = 128
+    let occlusionHeight = 72
+    let periodicReferenceLuma = (0..<(occlusionWidth * occlusionHeight)).map {
+        index -> UInt8 in
+        let x = index % occlusionWidth
+        let y = index / occlusionWidth
+        let value = ((x % 20) * 9 + y * 17 + (y / 3) * 29) % 208
+        return UInt8(24 + value)
+    }
+    let periodicReference = GimbalMotionSignature(
+        width: occlusionWidth,
+        height: occlusionHeight,
+        luma: periodicReferenceLuma
+    )
+    var edgeOccludedLuma = periodicReferenceLuma
+    for y in 0..<occlusionHeight {
+        for x in 0..<20 {
+            let index = y * occlusionWidth + x
+            edgeOccludedLuma[index] = UInt8(255 - Int(edgeOccludedLuma[index]))
+        }
+    }
+    let edgeOccluded = GimbalMotionSignature(
+        width: occlusionWidth,
+        height: occlusionHeight,
+        luma: edgeOccludedLuma
+    )
+    let edgeOcclusionEstimate = GimbalMotionAnalysis.estimateTranslation(
+        reference: periodicReference,
+        current: edgeOccluded
+    )
+    expect(
+        edgeOcclusionEstimate.horizontal.verdict != .moved,
+        "a stable edge occlusion must not manufacture joint horizontal motion"
+    )
+    var centerOccludedLuma = periodicReferenceLuma
+    for y in 0..<occlusionHeight {
+        for x in 32..<52 {
+            let index = y * occlusionWidth + x
+            centerOccludedLuma[index] = UInt8(255 - Int(centerOccludedLuma[index]))
+        }
+    }
+    let centerOccluded = GimbalMotionSignature(
+        width: occlusionWidth,
+        height: occlusionHeight,
+        luma: centerOccludedLuma
+    )
+    let centerOcclusionEstimate = GimbalMotionAnalysis.estimateTranslation(
+        reference: periodicReference,
+        current: centerOccluded
+    )
+    expect(
+        centerOcclusionEstimate.horizontal.verdict != .moved,
+        "a stable central occlusion must fail reverse registration instead of faking motion"
+    )
+    if case let .inconclusive(reason) = centerOcclusionEstimate.horizontal.verdict {
+        expect(
+            reason.contains("双向"),
+            "the central-occlusion regression must exercise bidirectional validation"
+        )
+    } else {
+        expect(false, "central occlusion must remain explicitly inconclusive")
+    }
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: false,
+            primaryVerdict: .inconclusive("scene changed"),
+            orthogonalVerdict: .noResponse
+        ) == .retryBeforeCommand,
+        "only a pre-command disturbance may offer retry"
+    )
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: true,
+            primaryVerdict: .noResponse,
+            orthogonalVerdict: .noResponse
+        ) == .awaitPhysicalNoMovementConfirmation,
+        "post-command no-response must require physical no-movement confirmation"
+    )
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: true,
+            primaryVerdict: .inconclusive("unknown"),
+            orthogonalVerdict: .noResponse
+        ) == .abortForUnknownPose,
+        "post-command inconclusive motion must fail closed"
+    )
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: true,
+            primaryVerdict: .moved,
+            orthogonalVerdict: .moved
+        ) == .abortForUnknownPose,
+        "orthogonal post-command motion must fail closed"
+    )
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: true,
+            primaryVerdict: .moved,
+            orthogonalVerdict: .noResponse,
+            reversesAcceptedDirection: true
+        ) == .abortForUnknownPose,
+        "reverse post-command motion must fail closed"
+    )
+    expect(
+        GimbalRangeCalibrationSafetyPolicy.disposition(
+            commandWasSent: true,
+            primaryVerdict: .moved,
+            orthogonalVerdict: .noResponse,
+            shiftBelowExpected: true
+        ) == .abortForUnknownPose,
+        "partial post-command motion must fail closed"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .awaitMovedStepConfirmation,
+            transientVisualUncertainty: false,
+            observationAttempt: 1
+        ) == .acceptMovedStep,
+        "clean camera-verified motion may advance without another click"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .awaitPhysicalNoMovementConfirmation,
+            transientVisualUncertainty: false,
+            observationAttempt: 1
+        ) == .requestNoMovementConfirmation,
+        "a clean no-response must still ask for physical boundary confirmation"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .abortForUnknownPose,
+            transientVisualUncertainty: true,
+            observationAttempt: 1
+        ) == .resampleObservation,
+        "transient post-command vision uncertainty may only resample"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .abortForUnknownPose,
+            transientVisualUncertainty: true,
+            observationAttempt: 3
+        ) == .pauseForManualRecovery,
+        "post-command resampling must stop at its fixed budget"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .abortForUnknownPose,
+            transientVisualUncertainty: false,
+            observationAttempt: 1
+        ) == .pauseForManualRecovery,
+        "geometric conflicts must never trigger automatic motion recovery"
+    )
+    expect(
+        GimbalRangeCalibrationRecoveryPolicy.action(
+            stopAccepted: true,
+            sessionsAreValid: true
+        ) == .pauseForManualRecovery,
+        "accepted STOP with live leases must preserve manual recovery"
+    )
+    expect(
+        GimbalRangeCalibrationRecoveryPolicy.action(
+            stopAccepted: false,
+            sessionsAreValid: true
+        ) == .terminate,
+        "rejected STOP must terminate calibration"
+    )
+    expect(
+        GimbalRangeCalibrationRecoveryPolicy.action(
+            stopAccepted: true,
+            sessionsAreValid: false
+        ) == .terminate,
+        "invalid leases must terminate calibration even after STOP submission"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.isTransientVisualUncertainty(
+            primaryVerdict: .inconclusive("exposure"),
+            orthogonalVerdict: .noResponse,
+            reversesAcceptedDirection: false,
+            shiftBelowExpected: false
+        ),
+        "visual-only inconclusive evidence may consume a resample"
+    )
+    expect(
+        !GimbalRangeCalibrationAutomationPolicy.isTransientVisualUncertainty(
+            primaryVerdict: .inconclusive("unknown"),
+            orthogonalVerdict: .moved,
+            reversesAcceptedDirection: false,
+            shiftBelowExpected: false
+        ),
+        "orthogonal motion must never be classified as transient"
+    )
+    let automaticMovedEstimate = GimbalMotionEstimate(
+        axisShift: 12,
+        zeroError: 0.20,
+        bestError: 0.03,
+        confidence: 0.80,
+        verdict: .moved
+    )
+    let automaticStationaryEstimate = GimbalMotionEstimate(
+        axisShift: 0,
+        zeroError: 0.01,
+        bestError: 0.01,
+        confidence: 0.85,
+        verdict: .noResponse
+    )
+    expect(
+        GimbalRangeCalibrationAutomaticEvidencePolicy.isReliableMoved(
+            primary: automaticMovedEstimate,
+            orthogonal: automaticStationaryEstimate,
+            axis: .horizontal
+        ),
+        "automatic moved evidence must pass the strict quality gate"
+    )
+    expect(
+        !GimbalRangeCalibrationAutomaticEvidencePolicy.isReliableMoved(
+            primary: GimbalMotionEstimate(
+                axisShift: 31,
+                zeroError: 0.20,
+                bestError: 0.03,
+                confidence: 0.80,
+                verdict: .moved
+            ),
+            orthogonal: automaticStationaryEstimate,
+            axis: .horizontal
+        ),
+        "a shift near the search boundary must not authorize automatic motion"
+    )
+    expect(
+        !GimbalRangeCalibrationAutomaticEvidencePolicy.isReliableMoved(
+            primary: GimbalMotionEstimate(
+                axisShift: 17,
+                zeroError: 0.20,
+                bestError: 0.03,
+                confidence: 0.80,
+                verdict: .moved
+            ),
+            orthogonal: automaticStationaryEstimate,
+            axis: .vertical
+        ),
+        "a vertical fit within two pixels of the search edge must be rejected"
+    )
+    expect(
+        GimbalRangeCalibrationAutomaticEvidencePolicy
+            .movedObservationsAreConsistent(
+                automaticMovedEstimate,
+                GimbalMotionEstimate(
+                    axisShift: 13,
+                    zeroError: 0.19,
+                    bestError: 0.03,
+                    confidence: 0.82,
+                    verdict: .moved
+                )
+            ),
+        "two same-direction moved observations within one pixel are consistent"
+    )
+    expect(
+        !GimbalRangeCalibrationAutomaticEvidencePolicy
+            .movedObservationsAreConsistent(
+                automaticMovedEstimate,
+                GimbalMotionEstimate(
+                    axisShift: -12,
+                    zeroError: 0.19,
+                    bestError: 0.03,
+                    confidence: 0.82,
+                    verdict: .moved
+                )
+            ),
+        "opposite moved observations must never authorize automatic bookkeeping"
+    )
+    expect(
+        GimbalRangeCalibrationAutomationPolicy.postCommandAction(
+            disposition: .abortForUnknownPose,
+            transientVisualUncertainty: true,
+            observationAttempt: 0
+        ) == .pauseForManualRecovery,
+        "invalid observation attempt zero must fail closed"
+    )
+    expect(
+        GimbalRangeCalibrationRecoveryPolicy.action(
+            stopAccepted: false,
+            sessionsAreValid: false
+        ) == .terminate,
+        "rejected STOP with invalid leases must terminate"
+    )
     do {
         _ = try OM3Protocol.rotationMessage(yawTenths: 40_000, pitchTenths: 0)
         expect(false, "out-of-range yaw must fail")

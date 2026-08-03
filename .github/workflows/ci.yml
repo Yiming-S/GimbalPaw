@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS Swift
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: macOS/OM3Lab
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Show Swift toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build Swift package
+        run: swift build --product OM3Lab
+
+      - name: Run Swift tests
+        run: swift test
+
+      - name: Run protocol self-check
+        run: |
+          set -euo pipefail
+          protocol_test="$RUNNER_TEMP/OM3ProtocolSelfTest"
+          swiftc \
+            -swift-version 5 \
+            -module-name OM3ProtocolSelfTest \
+            Sources/OM3Lab/OM3Protocol.swift \
+            Sources/OM3Lab/PersonTracking.swift \
+            Sources/OM3Lab/GimbalMotionAnalysis.swift \
+            Tests/ProtocolSelfTest/main.swift \
+            -o "$protocol_test"
+          "$protocol_test"
+
+  web:
+    name: Node Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.13.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build and test
+        run: npm test

@@ -125,11 +125,14 @@ final class CameraPreviewNSView: NSView {
         }
 
         let guide = CGMutablePath()
-        let center = CGPoint(x: previewLayer.bounds.midX, y: previewLayer.bounds.midY)
-        guide.move(to: CGPoint(x: center.x - 13, y: center.y))
-        guide.addLine(to: CGPoint(x: center.x + 13, y: center.y))
-        guide.move(to: CGPoint(x: center.x, y: center.y - 13))
-        guide.addLine(to: CGPoint(x: center.x, y: center.y + 13))
+        let target = layerPoint(
+            metadataX: 0.5,
+            metadataY: PersonTrackingPolicy.verticalHeadAnchorTarget
+        )
+        guide.move(to: CGPoint(x: target.x - 13, y: target.y))
+        guide.addLine(to: CGPoint(x: target.x + 13, y: target.y))
+        guide.move(to: CGPoint(x: target.x, y: target.y - 13))
+        guide.addLine(to: CGPoint(x: target.x, y: target.y + 13))
         frameCenterLayer.path = guide
 
         let candidatePath = CGMutablePath()
@@ -162,10 +165,14 @@ final class CameraPreviewNSView: NSView {
             let isSelected = candidate.id == selectedPersonID
             if isSelected {
                 selectedPath.addPath(box)
+                let headAnchor = layerPoint(
+                    metadataX: detection.centerX,
+                    metadataY: PersonTrackingPolicy.headAnchorY(for: detection)
+                )
                 centerPath.addEllipse(
                     in: CGRect(
-                        x: layerRect.midX - 4,
-                        y: layerRect.midY - 4,
+                        x: headAnchor.x - 4,
+                        y: headAnchor.y - 4,
                         width: 8,
                         height: 8
                     )
@@ -191,6 +198,22 @@ final class CameraPreviewNSView: NSView {
         candidateBoxLayer.path = candidatePath
         selectedPersonBoxLayer.path = selectedPath
         personCenterLayer.path = centerPath
+    }
+
+    /// AVCaptureVideoPreviewLayer owns aspect-fit and letterbox conversion.
+    /// Converting a tiny metadata rectangle is more reliable than duplicating
+    /// that geometry, and keeps the control marker aligned on every camera.
+    private func layerPoint(metadataX: Double, metadataY: Double) -> CGPoint {
+        let epsilon = 0.000_1
+        let rect = previewLayer.layerRectConverted(
+            fromMetadataOutputRect: CGRect(
+                x: metadataX - epsilon / 2,
+                y: metadataY - epsilon / 2,
+                width: epsilon,
+                height: epsilon
+            )
+        )
+        return CGPoint(x: rect.midX, y: rect.midY)
     }
 
     private func updateLabel(

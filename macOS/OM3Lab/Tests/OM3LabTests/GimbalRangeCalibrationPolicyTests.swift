@@ -2,13 +2,103 @@ import XCTest
 @testable import OM3Lab
 
 final class GimbalRangeCalibrationPolicyTests: XCTestCase {
-    func testProbeParametersRetainExplicitMargins() {
+    func testPublishedHardwareCeilingsRemainSanityValues() {
+        XCTAssertEqual(OM3HardwareMotionLimits.structuralCeilingDegrees.left, 162.5)
+        XCTAssertEqual(OM3HardwareMotionLimits.structuralCeilingDegrees.right, 170.3)
+        XCTAssertEqual(OM3HardwareMotionLimits.structuralCeilingDegrees.up, 104.5)
+        XCTAssertEqual(OM3HardwareMotionLimits.structuralCeilingDegrees.down, 235.7)
+        XCTAssertEqual(
+            OM3HardwareMotionLimits.maximumControllableSpeedDegreesPerSecond,
+            120.0
+        )
+    }
+
+    func testProbeParametersAlignDownAndKeepEndpointReserve() {
         XCTAssertEqual(GimbalRangeCalibrationPolicy.yawStepDegrees, 5)
         XCTAssertEqual(GimbalRangeCalibrationPolicy.pitchStepDegrees, 2)
-        XCTAssertEqual(GimbalRangeCalibrationPolicy.yawProbeLimitDegrees, 100)
-        XCTAssertEqual(GimbalRangeCalibrationPolicy.pitchProbeLimitDegrees, 36)
         XCTAssertEqual(GimbalRangeCalibrationPolicy.yawSafetyMarginDegrees, 10)
         XCTAssertEqual(GimbalRangeCalibrationPolicy.pitchSafetyMarginDegrees, 6)
+
+        let expectedCaps: [OM3HardwareMotionLimits.Direction: Int] = [
+            .left: 150,
+            .right: 160,
+            .up: 98,
+            .down: 228,
+        ]
+        for direction in OM3HardwareMotionLimits.Direction.allCases {
+            guard let expectedCap = expectedCaps[direction] else {
+                XCTFail("Missing expected probe cap for \(direction)")
+                continue
+            }
+            let cap = OM3HardwareMotionLimits.probeCapDegrees(for: direction)
+            let step = OM3HardwareMotionLimits.probeStepDegrees(for: direction)
+            let ceiling = OM3HardwareMotionLimits.structuralCeilingDegrees
+                .value(for: direction)
+            let reserve = OM3HardwareMotionLimits.mechanicalEndpointReserveDegrees
+                .value(for: direction)
+
+            XCTAssertEqual(cap, expectedCap)
+            XCTAssertEqual(cap % step, 0)
+            XCTAssertLessThanOrEqual(Double(cap), ceiling - reserve)
+            XCTAssertGreaterThan(Double(cap + step), ceiling - reserve)
+        }
+
+        XCTAssertEqual(GimbalCalibrationDirection.left.probeLimitDegrees, 150)
+        XCTAssertEqual(GimbalCalibrationDirection.right.probeLimitDegrees, 160)
+        XCTAssertEqual(GimbalCalibrationDirection.up.probeLimitDegrees, 98)
+        XCTAssertEqual(GimbalCalibrationDirection.down.probeLimitDegrees, 228)
+    }
+
+    func testMaximumCalibratedEnvelopeSubtractsASecondTrackingMargin() {
+        XCTAssertEqual(
+            OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees,
+            OM3HardwareMotionLimits.DirectionalWholeDegrees(
+                left: 140,
+                right: 150,
+                up: 92,
+                down: 222
+            )
+        )
+    }
+
+    func testCenteredFallbackIsLargerButWellInsideStructuralCeilings() {
+        let fallback = OM3HardwareMotionLimits.centeredFallbackEnvelopeDegrees
+        XCTAssertEqual(
+            fallback,
+            OM3HardwareMotionLimits.DirectionalWholeDegrees(
+                left: 120,
+                right: 120,
+                up: 60,
+                down: 60
+            )
+        )
+        XCTAssertEqual(
+            GimbalTrackingEnvelope.conservativeDefault,
+            OM3HardwareMotionLimits.centeredFallbackTrackingEnvelope
+        )
+        XCTAssertTrue(
+            OM3HardwareMotionLimits.isWithinStructuralSanityCeiling(
+                yawTenths: -fallback.left * 10,
+                pitchTenths: -fallback.up * 10
+            )
+        )
+        XCTAssertTrue(
+            OM3HardwareMotionLimits.isWithinStructuralSanityCeiling(
+                yawTenths: fallback.right * 10,
+                pitchTenths: fallback.down * 10
+            )
+        )
+    }
+
+    func testOfficialSpeedCapScalesWithDeclaredCommandDuration() {
+        XCTAssertEqual(
+            OM3HardwareMotionLimits.maximumCombinedCommandTenths(durationTenths: 1),
+            120
+        )
+        XCTAssertEqual(
+            OM3HardwareMotionLimits.maximumCombinedCommandTenths(durationTenths: 3),
+            360
+        )
     }
 
     func testUsableExtentSubtractsAxisSpecificMargin() {

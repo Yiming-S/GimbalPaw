@@ -75,7 +75,7 @@ enum PersonTrackingCommandResult: Equatable {
 }
 
 enum PersonSearchCommandResult: Equatable {
-    case submitted(yawTenths: Int, reachesSoftBoundary: Bool)
+    case submitted(correction: PersonTrackingCorrection, reachesSoftBoundary: Bool)
     case busy
     case softBoundaryReached
     case hardBoundaryReached
@@ -429,7 +429,7 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         let session = UUID()
         activeRangeCalibrationSession = session
         rangeCalibrationActive = true
-        appendLog("全向行程验证已取得独占控制；每一步都需要人工确认。")
+        appendLog("全向行程验证已取得独占控制；可信同轴步进自动继续，边界与异常仍需确认。")
         return session
     }
 
@@ -537,10 +537,7 @@ final class OM3BluetoothController: NSObject, ObservableObject {
               motionSafetyArmed,
               !rangeCalibrationActive,
               !personTrackingActive,
-              envelope.leftYawTenths <= 900,
-              envelope.rightYawTenths <= 900,
-              envelope.upPitchTenths <= 300,
-              envelope.downPitchTenths <= 300
+              OM3HardwareMotionLimits.isValidCalibratedTrackingEnvelope(envelope)
         else {
             appendLog("校准范围未启用：连接、安全状态或范围数据无效。")
             return false
@@ -602,7 +599,12 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         )
         guard abs(correction.yawTenths) <= activeTrackingSpeedMode.yawMaximumTenths,
               abs(correction.pitchTenths) <= activeTrackingSpeedMode.pitchMaximumTenths,
-              combinedMagnitude <= Double(activeTrackingSpeedMode.combinedMaximumTenths) + 0.01
+              combinedMagnitude <= Double(activeTrackingSpeedMode.combinedMaximumTenths) + 0.01,
+              combinedMagnitude <= Double(
+                  OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                      durationTenths: activeTrackingSpeedMode.commandDurationTenths
+                  )
+              ) + 0.01
         else {
             appendLog("人物跟踪修正超出当前速度档位上限，已拦截。")
             return .failed
@@ -631,7 +633,18 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         ) else {
             return .boundaryReached
         }
-        guard nextYawTravel <= 900, nextPitchTravel <= 300 else {
+        guard OM3HardwareMotionLimits.isWithinStructuralSanityCeiling(
+            yawTenths: nextYawBudget,
+            pitchTenths: nextPitchBudget
+        ) else {
+            appendLog("人物跟踪姿态超出 OM3 官方结构范围 sanity ceiling，已拦截。")
+            return .boundaryReached
+        }
+        guard PersonTrackingTravelBudgetPolicy.allowsCorrection(
+            nextYawTravelTenths: nextYawTravel,
+            nextPitchTravelTenths: nextPitchTravel,
+            speedMode: activeTrackingSpeedMode
+        ) else {
             return .safetyBudgetExhausted
         }
 
@@ -678,38 +691,36 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         guard state.isReady,
               motionSafetyArmed,
               activeTrackingSession == session,
-              activeTrackingSpeedMode != nil,
+              let activeTrackingSpeedMode,
               personTrackingActive
         else { return .inactive }
         guard trackingCommandAvailable else { return .busy }
 
-        let yawTenths: Int
-        let reachesSoftBoundary: Bool
+        let requestedCorrection = PersonSearchPolicy.requestedStep(
+            direction: direction,
+            mode: mode
+        )
         let durationTenths: UInt8
         let cooldown: TimeInterval
         switch mode {
         case .coast:
-            guard let step = PersonSearchPolicy.coastStep(
-                currentYawTenths: trackingYawBudgetTenths,
-                direction: direction
-            ) else {
-                return .softBoundaryReached
-            }
-            yawTenths = step.yawTenths
-            reachesSoftBoundary = step.reachesSoftBoundary
             durationTenths = PersonSearchPolicy.coastDurationTenths
             cooldown = PersonSearchPolicy.coastCooldown
         case .scan:
-            guard let step = PersonSearchPolicy.scanStep(
-                currentYawTenths: trackingYawBudgetTenths,
-                direction: direction
-            ) else {
-                return .softBoundaryReached
-            }
-            yawTenths = step.yawTenths
-            reachesSoftBoundary = step.reachesSoftBoundary
             durationTenths = PersonSearchPolicy.scanDurationTenths
             cooldown = PersonSearchPolicy.scanCooldown
+        }
+        let requestedMagnitude = hypot(
+            Double(requestedCorrection.yawTenths),
+            Double(requestedCorrection.pitchTenths)
+        )
+        guard requestedMagnitude <= Double(
+            OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                durationTenths: durationTenths
+            )
+        ) + 0.01 else {
+            appendLog("人物搜索修正超过 OM3 官方 120°/s 上限，已拦截。")
+            return .failed
         }
 
         let latestFirstWriteAtUptime = PersonSearchPolicy.latestFirstWriteUptime(
@@ -720,29 +731,58 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         guard ProcessInfo.processInfo.systemUptime <= latestFirstWriteAtUptime else {
             return .busy
         }
-        let nextYawBudget = trackingYawBudgetTenths + yawTenths
+        guard let submittedCorrection = PersonTrackingPolicy
+            .correctionClampedToNetSafetyBoundary(
+                requestedCorrection,
+                currentYawTenths: trackingYawBudgetTenths,
+                currentPitchTenths: trackingPitchBudgetTenths,
+                envelope: activeTrackingEnvelope
+            )
+        else {
+            // Reaching one side of the active envelope is a scan turn, not a
+            // fatal tracking error. The coordinator rotates the search axis.
+            return .softBoundaryReached
+        }
+        let reachesSoftBoundary = PersonSearchPolicy.reachesEnvelopeBoundary(
+            requested: requestedCorrection,
+            submitted: submittedCorrection
+        )
+        let nextYawBudget = trackingYawBudgetTenths + submittedCorrection.yawTenths
+        let nextPitchBudget = trackingPitchBudgetTenths + submittedCorrection.pitchTenths
         guard activeTrackingEnvelope.contains(
             yawTenths: nextYawBudget,
-            pitchTenths: trackingPitchBudgetTenths
+            pitchTenths: nextPitchBudget
         ) else {
             return .hardBoundaryReached
         }
-        let nextYawTravel = trackingYawTravelTenths + abs(yawTenths)
-        guard nextYawTravel <= 900 else {
+        guard OM3HardwareMotionLimits.isWithinStructuralSanityCeiling(
+            yawTenths: nextYawBudget,
+            pitchTenths: nextPitchBudget
+        ) else {
+            appendLog("人物搜索姿态超出 OM3 官方结构范围 sanity ceiling，已拦截。")
+            return .hardBoundaryReached
+        }
+        let nextYawTravel = trackingYawTravelTenths + abs(submittedCorrection.yawTenths)
+        let nextPitchTravel = trackingPitchTravelTenths + abs(submittedCorrection.pitchTenths)
+        guard PersonTrackingTravelBudgetPolicy.allowsCorrection(
+            nextYawTravelTenths: nextYawTravel,
+            nextPitchTravelTenths: nextPitchTravel,
+            speedMode: activeTrackingSpeedMode
+        ) else {
             return .safetyBudgetExhausted
         }
 
         do {
             let frame = try OM3Protocol.relativeMove(
-                yawTenths: yawTenths,
-                pitchTenths: 0,
+                yawTenths: submittedCorrection.yawTenths,
+                pitchTenths: submittedCorrection.pitchTenths,
                 durationTenths: durationTenths
             )
             trackingCommandAvailable = false
             let token = UUID()
             trackingCooldownToken = token
             let action = mode == .coast ? "出框惯性" : "自动扫描"
-            let label = "人物搜索 · \(action) Yaw \(formatTenths(yawTenths))°"
+            let label = "人物搜索 · \(action) Yaw \(formatTenths(submittedCorrection.yawTenths))° / Pitch \(formatTenths(submittedCorrection.pitchTenths))°"
             let submitted = enqueue(
                 frame,
                 label: label,
@@ -750,10 +790,7 @@ final class OM3BluetoothController: NSObject, ObservableObject {
                     session: session,
                     token: token,
                     delay: cooldown,
-                    motionDelta: PersonTrackingCorrection(
-                        yawTenths: yawTenths,
-                        pitchTenths: 0
-                    )
+                    motionDelta: submittedCorrection
                 ),
                 expiresAtUptime: latestFirstWriteAtUptime
             )
@@ -762,7 +799,7 @@ final class OM3BluetoothController: NSObject, ObservableObject {
                 return .failed
             }
             return .submitted(
-                yawTenths: yawTenths,
+                correction: submittedCorrection,
                 reachesSoftBoundary: reachesSoftBoundary
             )
         } catch {

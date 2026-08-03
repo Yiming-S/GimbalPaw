@@ -2,91 +2,117 @@ import XCTest
 @testable import OM3Lab
 
 final class PersonTrackingPolicyTests: XCTestCase {
-    func testSearchDirectionRawValuesOppositesAndTitles() {
-        XCTAssertEqual(PersonSearchDirection.left.rawValue, -1)
-        XCTAssertEqual(PersonSearchDirection.right.rawValue, 1)
+    func testSearchDirectionOppositesClockwiseCycleAndTitles() {
+        XCTAssertEqual(PersonSearchDirection.allCases, [.left, .right, .up, .down])
         XCTAssertEqual(PersonSearchDirection.left.opposite, .right)
         XCTAssertEqual(PersonSearchDirection.right.opposite, .left)
+        XCTAssertEqual(PersonSearchDirection.up.opposite, .down)
+        XCTAssertEqual(PersonSearchDirection.down.opposite, .up)
+        XCTAssertEqual(PersonSearchDirection.right.clockwise, .down)
+        XCTAssertEqual(PersonSearchDirection.down.clockwise, .left)
+        XCTAssertEqual(PersonSearchDirection.left.clockwise, .up)
+        XCTAssertEqual(PersonSearchDirection.up.clockwise, .right)
         XCTAssertEqual(PersonSearchDirection.left.title, "向左")
         XCTAssertEqual(PersonSearchDirection.right.title, "向右")
+        XCTAssertEqual(PersonSearchDirection.up.title, "向上")
+        XCTAssertEqual(PersonSearchDirection.down.title, "向下")
         XCTAssertEqual(PersonSearchMotionMode.allCases, [.coast, .scan])
     }
 
     func testSearchPolicyUsesBoundedCoastAndScanParameters() {
-        XCTAssertEqual(PersonSearchPolicy.coastStepTenths, 10)
+        XCTAssertEqual(PersonSearchPolicy.coastStepTenths, 20)
         XCTAssertEqual(PersonSearchPolicy.coastDurationTenths, 1)
-        XCTAssertEqual(PersonSearchPolicy.coastCooldown, 0.23, accuracy: 0.000_001)
+        XCTAssertEqual(PersonSearchPolicy.coastCooldown, 0.10, accuracy: 0.000_001)
         XCTAssertEqual(PersonSearchPolicy.lossGraceStopCooldown, 0.12, accuracy: 0.000_001)
-        XCTAssertEqual(PersonSearchPolicy.maximumCoastTravelTenths, 20)
+        XCTAssertEqual(PersonSearchPolicy.maximumCoastTravelTenths, 60)
 
-        XCTAssertEqual(PersonSearchPolicy.scanSoftYawLimitTenths, 200)
-        XCTAssertEqual(PersonSearchPolicy.scanStepTenths, 20)
-        XCTAssertEqual(PersonSearchPolicy.scanDurationTenths, 3)
-        XCTAssertEqual(PersonSearchPolicy.scanCooldown, 0.45, accuracy: 0.000_001)
-        XCTAssertEqual(PersonSearchPolicy.scanSettleDuration, 0.30, accuracy: 0.000_001)
-        XCTAssertEqual(PersonSearchPolicy.maximumScanEpisodeDuration, 12.0, accuracy: 0.000_001)
-        XCTAssertEqual(PersonSearchPolicy.maximumScanEpisodeTravelTenths, 600)
-        XCTAssertEqual(PersonSearchPolicy.maximumScanBoundaryTouches, 2)
+        XCTAssertEqual(PersonSearchPolicy.scanStepTenths, 50)
+        XCTAssertEqual(PersonSearchPolicy.scanDurationTenths, 1)
+        XCTAssertEqual(PersonSearchPolicy.scanCooldown, 0.10, accuracy: 0.000_001)
+        XCTAssertEqual(PersonSearchPolicy.scanSettleDuration, 0.12, accuracy: 0.000_001)
+        XCTAssertEqual(PersonSearchPolicy.maximumScanEpisodeDuration, 180.0, accuracy: 0.000_001)
+        XCTAssertEqual(PersonSearchPolicy.maximumScanEpisodeTravelTenths, 30_000)
         XCTAssertEqual(PersonSearchPolicy.commandMaximumAge, 0.25, accuracy: 0.000_001)
         XCTAssertEqual(PersonSearchPolicy.commandRetryInterval, 0.05, accuracy: 0.000_001)
         XCTAssertEqual(PersonSearchPolicy.maximumVisionSilence, 0.50, accuracy: 0.000_001)
     }
 
     func testCoastRequiresTrustedOutwardEdgeTrajectory() {
+        let rightExit = [
+            PersonSearchObservation(centerX: 0.78, centerY: 0.50, confidence: 0.8),
+            PersonSearchObservation(centerX: 0.83, centerY: 0.50, confidence: 0.8),
+            PersonSearchObservation(centerX: 0.89, centerY: 0.50, confidence: 0.8),
+        ]
         XCTAssertEqual(
             PersonSearchPolicy.coastDirection(
-                recentCenterXs: [0.78, 0.83, 0.89],
-                lastConfidence: 0.8,
-                lastYawTenths: 10
+                recentObservations: rightExit,
+                lastCorrection: PersonTrackingCorrection(yawTenths: 10, pitchTenths: 0)
             ),
             .right
         )
         XCTAssertNil(
             PersonSearchPolicy.coastDirection(
-                recentCenterXs: [0.78, 0.83, 0.89],
-                lastConfidence: 0.8,
-                lastYawTenths: -10
+                recentObservations: rightExit,
+                lastCorrection: PersonTrackingCorrection(yawTenths: -10, pitchTenths: 0)
             )
+        )
+        let upExit = [
+            PersonSearchObservation(centerX: 0.50, centerY: 0.21, confidence: 0.8),
+            PersonSearchObservation(centerX: 0.50, centerY: 0.16, confidence: 0.8),
+            PersonSearchObservation(centerX: 0.50, centerY: 0.10, confidence: 0.8),
+        ]
+        XCTAssertEqual(
+            PersonSearchPolicy.coastDirection(
+                recentObservations: upExit,
+                lastCorrection: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -10)
+            ),
+            .up
         )
         XCTAssertNil(
             PersonSearchPolicy.coastDirection(
-                recentCenterXs: [0.80, 0.86, 0.84, 0.89],
-                lastConfidence: 0.8,
-                lastYawTenths: 10
+                recentObservations: [
+                    PersonSearchObservation(centerX: 0.80, centerY: 0.5, confidence: 0.8),
+                    PersonSearchObservation(centerX: 0.86, centerY: 0.5, confidence: 0.8),
+                    PersonSearchObservation(centerX: 0.84, centerY: 0.5, confidence: 0.8),
+                    PersonSearchObservation(centerX: 0.89, centerY: 0.5, confidence: 0.8),
+                ],
+                lastCorrection: PersonTrackingCorrection(yawTenths: 10, pitchTenths: 0)
             )
         )
     }
 
-    func testScanStepMovesTowardSelectedBoundary() {
+    func testRequestedSearchStepsCoverBothAxes() {
         XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: 0, direction: .left),
-            PersonSearchStep(yawTenths: -20, reachesSoftBoundary: false)
+            PersonSearchPolicy.requestedStep(direction: .left, mode: .scan),
+            PersonTrackingCorrection(yawTenths: -50, pitchTenths: 0)
         )
         XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: 0, direction: .right),
-            PersonSearchStep(yawTenths: 20, reachesSoftBoundary: false)
+            PersonSearchPolicy.requestedStep(direction: .right, mode: .scan),
+            PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0)
+        )
+        XCTAssertEqual(
+            PersonSearchPolicy.requestedStep(direction: .up, mode: .scan),
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -50)
+        )
+        XCTAssertEqual(
+            PersonSearchPolicy.requestedStep(direction: .down, mode: .coast),
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: 20)
         )
     }
 
-    func testScanStepClampsFinalCommandAndReportsBoundary() {
-        XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: -190, direction: .left),
-            PersonSearchStep(yawTenths: -10, reachesSoftBoundary: true)
+    func testSearchBoundaryDetectionComparesCompleteCorrection() {
+        XCTAssertFalse(
+            PersonSearchPolicy.reachesEnvelopeBoundary(
+                requested: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20),
+                submitted: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20)
+            )
         )
-        XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: 195, direction: .right),
-            PersonSearchStep(yawTenths: 5, reachesSoftBoundary: true)
+        XCTAssertTrue(
+            PersonSearchPolicy.reachesEnvelopeBoundary(
+                requested: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20),
+                submitted: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -5)
+            )
         )
-        XCTAssertNil(PersonSearchPolicy.scanStep(currentYawTenths: -200, direction: .left))
-        XCTAssertNil(PersonSearchPolicy.scanStep(currentYawTenths: 200, direction: .right))
-    }
-
-    func testCoastStepAlsoStopsAtSoftBoundary() {
-        XCTAssertEqual(
-            PersonSearchPolicy.coastStep(currentYawTenths: 195, direction: .right),
-            PersonSearchStep(yawTenths: 5, reachesSoftBoundary: true)
-        )
-        XCTAssertNil(PersonSearchPolicy.coastStep(currentYawTenths: 200, direction: .right))
     }
 
     func testSearchPacketDeadlineLeavesTimeForWholeMotion() {
@@ -110,19 +136,6 @@ final class PersonTrackingPolicyTests: XCTestCase {
         )
     }
 
-    func testScanStepOutsideSoftRangeOnlyAllowsMotionTowardOrigin() {
-        XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: 250, direction: .left),
-            PersonSearchStep(yawTenths: -20, reachesSoftBoundary: false)
-        )
-        XCTAssertNil(PersonSearchPolicy.scanStep(currentYawTenths: 250, direction: .right))
-        XCTAssertEqual(
-            PersonSearchPolicy.scanStep(currentYawTenths: -250, direction: .right),
-            PersonSearchStep(yawTenths: 20, reachesSoftBoundary: false)
-        )
-        XCTAssertNil(PersonSearchPolicy.scanStep(currentYawTenths: -250, direction: .left))
-    }
-
     func testCenteredPersonNeedsNoCorrection() {
         XCTAssertNil(PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.5)))
     }
@@ -141,16 +154,26 @@ final class PersonTrackingPolicyTests: XCTestCase {
     }
 
     func testVerticalDirectionMatchesCalibratedOM3Mapping() {
-        // The head anchor (box top + 0.25 × height) against the 0.32 target
-        // reproduces the old center-based error for the standard test box:
-        // centerY 0.20 → error −0.22, minimum→medium ramp → 5 + 0.7·15 ≈ 16.
+        // The filtered head anchor (box top + 0.25 × height) targets Y=0.32.
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.20)),
-            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -16)
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20)
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.90)),
             PersonTrackingCorrection(yawTenths: 0, pitchTenths: 20)
+        )
+    }
+
+    func testTighterVerticalHysteresisRespondsToOrdinaryPitchError() {
+        XCTAssertEqual(PersonTrackingPolicy.verticalDeadZone, 0.08, accuracy: 0.000_001)
+        XCTAssertEqual(PersonTrackingPolicy.verticalInnerDeadZone, 0.04, accuracy: 0.000_001)
+        XCTAssertEqual(
+            PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.51)),
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: 7)
+        )
+        XCTAssertNil(
+            PersonTrackingPolicy.correction(for: detection(centerX: 0.5, centerY: 0.50))
         )
     }
 
@@ -275,6 +298,126 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertNil(decision.correction,
                      "the reversing axis is held for one cycle instead")
         XCTAssertFalse(decision.centering.yawCentered)
+        XCTAssertEqual(decision.minorReversalAxes, [.yaw])
+    }
+
+    func testSignificantPitchReversalRequiresStop() {
+        let decision = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.50,
+            anchorY: 0.60,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 0, pitchTenths: -20),
+            speedMode: .fast
+        )
+        XCTAssertTrue(decision.requiresReversalStop)
+        XCTAssertNil(decision.correction)
+        XCTAssertTrue(decision.minorReversalAxes.isEmpty)
+    }
+
+    func testMinorReversalIsConsumedSoSecondFrameCanReverse() throws {
+        let previous = PersonTrackingCorrection(yawTenths: 30, pitchTenths: 0)
+        let first = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.40,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: previous,
+            speedMode: .fast
+        )
+        XCTAssertNil(first.correction, "the first reverse frame is the one-cycle hold")
+
+        let consumedHistory = first.minorReversalAxes.consuming(previous)
+        XCTAssertNil(consumedHistory, "the held yaw direction must be consumed")
+        let second = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.40,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: first.centering,
+            previousCorrection: consumedHistory,
+            speedMode: .fast
+        )
+        XCTAssertLessThan(
+            try XCTUnwrap(second.correction).yawTenths,
+            0,
+            "the same small reverse error must move on the following frame"
+        )
+        XCTAssertTrue(second.minorReversalAxes.isEmpty)
+    }
+
+    func testMinorReversalConsumptionOnlyClearsAffectedAxis() {
+        let previous = PersonTrackingCorrection(yawTenths: 30, pitchTenths: -12)
+        XCTAssertEqual(
+            PersonTrackingReversalAxes.yaw.consuming(previous),
+            PersonTrackingCorrection(yawTenths: 0, pitchTenths: -12)
+        )
+        XCTAssertEqual(
+            PersonTrackingReversalAxes.pitch.consuming(previous),
+            PersonTrackingCorrection(yawTenths: 30, pitchTenths: 0)
+        )
+    }
+
+    func testDelayedPipelineDoesNotRenewMotionSafeVision() {
+        var health = PersonTrackingVisionHealth()
+        XCTAssertTrue(
+            health.record(
+                sampleObservedAtUptime: 99.95,
+                receivedAtUptime: 100.0,
+                maximumSampleAge: 0.10
+            )
+        )
+        XCTAssertEqual(
+            health.motionSafety(at: 100.40, maximumSilence: 0.50),
+            .safe
+        )
+
+        for receivedAt in stride(from: 100.20, through: 100.80, by: 0.20) {
+            XCTAssertFalse(
+                health.record(
+                    sampleObservedAtUptime: receivedAt - 0.20,
+                    receivedAtUptime: receivedAt,
+                    maximumSampleAge: 0.10
+                )
+            )
+        }
+        XCTAssertEqual(
+            health.motionSafety(at: 100.80, maximumSilence: 0.50),
+            .samplesTooOld,
+            "active but delayed delivery must not authorize an automatic scan"
+        )
+        XCTAssertEqual(
+            health.motionSafety(at: 101.40, maximumSilence: 0.50),
+            .pipelineStalled
+        )
+    }
+
+    func testVisionAuthorizationDeadlineMustCoverWholeScanMotion() throws {
+        var health = PersonTrackingVisionHealth()
+        XCTAssertTrue(
+            health.record(
+                sampleObservedAtUptime: 99.95,
+                receivedAtUptime: 100.0,
+                maximumSampleAge: 0.10
+            )
+        )
+        let deadline = try XCTUnwrap(
+            health.motionAuthorizationDeadline(maximumSilence: 0.50)
+        )
+        XCTAssertEqual(deadline, 100.50, accuracy: 0.000_001)
+        let scanDuration = Double(PersonSearchPolicy.scanDurationTenths) / 10.0
+        XCTAssertGreaterThan(
+            100.21 + scanDuration,
+            deadline,
+            "a scan that starts while currently safe can still finish too late"
+        )
+        XCTAssertLessThanOrEqual(
+            100.20 + scanDuration,
+            deadline,
+            "a scan finishing exactly at the authorization deadline is allowed"
+        )
     }
 
     func testMajorReversalRequestsStop() {
@@ -404,6 +547,10 @@ final class PersonTrackingPolicyTests: XCTestCase {
             PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0)
         )
         XCTAssertEqual(
+            PersonTrackingPolicy.correction(for: farLeft, speedMode: .turbo50x),
+            PersonTrackingCorrection(yawTenths: -120, pitchTenths: 0)
+        )
+        XCTAssertEqual(
             PersonTrackingPolicy.correction(
                 for: detection(centerX: 0.65, centerY: 0.5),
                 speedMode: .fast
@@ -417,16 +564,35 @@ final class PersonTrackingPolicyTests: XCTestCase {
             ),
             PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0)
         )
+        XCTAssertEqual(
+            PersonTrackingPolicy.correction(
+                for: detection(centerX: 0.65, centerY: 0.5),
+                speedMode: .turbo50x
+            ),
+            PersonTrackingCorrection(yawTenths: 47, pitchTenths: 0)
+        )
+        XCTAssertEqual(
+            PersonTrackingPolicy.correction(
+                for: detection(centerX: 0.78, centerY: 0.5),
+                speedMode: .turbo50x
+            ),
+            PersonTrackingCorrection(yawTenths: 114, pitchTenths: 0)
+        )
 
         for mode in PersonTrackingSpeedMode.allCases {
             let duration = Double(mode.commandDurationTenths) / 10.0
-            if mode == .fast {
+            if mode == .fast || mode == .turbo50x {
                 XCTAssertEqual(mode.commandCooldown, duration, accuracy: 0.000_001)
             } else {
                 XCTAssertGreaterThanOrEqual(mode.commandCooldown, duration + 0.10)
             }
-            XCTAssertLessThanOrEqual(mode.pitchMaximumTenths, 20)
-            XCTAssertLessThanOrEqual(mode.combinedMaximumTenths, 65)
+            XCTAssertLessThanOrEqual(mode.pitchMaximumTenths, 91)
+            XCTAssertLessThanOrEqual(
+                mode.combinedMaximumTenths,
+                OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                    durationTenths: mode.commandDurationTenths
+                )
+            )
         }
 
         let previousContinuousMaximumRate = 45.0 / 0.21
@@ -440,7 +606,134 @@ final class PersonTrackingPolicyTests: XCTestCase {
             PersonTrackingSpeedMode.fast.maximumSampleAge,
             PersonTrackingSpeedMode.fast.commandCooldown
         )
+        let smoothYawRate = Double(PersonTrackingSpeedMode.smooth.yawMaximumTenths)
+            / PersonTrackingSpeedMode.smooth.commandCooldown
+        let turboYawRate = Double(PersonTrackingSpeedMode.turbo50x.yawMaximumTenths)
+            / PersonTrackingSpeedMode.turbo50x.commandCooldown
+        let smoothPitchRate = Double(PersonTrackingSpeedMode.smooth.pitchMaximumTenths)
+            / PersonTrackingSpeedMode.smooth.commandCooldown
+        let turboPitchRate = Double(PersonTrackingSpeedMode.turbo50x.pitchMaximumTenths)
+            / PersonTrackingSpeedMode.turbo50x.commandCooldown
+        XCTAssertEqual(
+            turboYawRate,
+            Double(OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond),
+            accuracy: 0.000_001
+        )
+        XCTAssertGreaterThan(turboYawRate / smoothYawRate, 40.0)
+        XCTAssertLessThanOrEqual(turboYawRate / smoothYawRate, 50.0)
+        XCTAssertEqual(turboPitchRate / smoothPitchRate, 50.0, accuracy: 0.5)
+        XCTAssertEqual(
+            Double(PersonTrackingSpeedMode.turbo50x.minimumStepTenths)
+                / PersonTrackingSpeedMode.turbo50x.commandCooldown
+                / (Double(PersonTrackingSpeedMode.smooth.minimumStepTenths)
+                    / PersonTrackingSpeedMode.smooth.commandCooldown),
+            50.0,
+            accuracy: 1.5
+        )
+        XCTAssertEqual(
+            Double(PersonTrackingSpeedMode.turbo50x.mediumStepTenths)
+                / PersonTrackingSpeedMode.turbo50x.commandCooldown
+                / (Double(PersonTrackingSpeedMode.smooth.mediumStepTenths)
+                    / PersonTrackingSpeedMode.smooth.commandCooldown),
+            50.0,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(PersonTrackingSpeedMode.turbo50x.commandDurationTenths, 1)
+        XCTAssertLessThanOrEqual(
+            PersonTrackingSpeedMode.turbo50x.maximumSampleAge,
+            PersonTrackingSpeedMode.turbo50x.commandCooldown
+        )
         XCTAssertGreaterThanOrEqual(PersonTrackingPolicy.minimumStopCooldown, 0.12)
+    }
+
+    func testTurboProfileRemovesLegacyGrowthBottleneckButStillStopsOnReverse() throws {
+        let growth = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.95,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
+            speedMode: .turbo50x
+        )
+        XCTAssertEqual(try XCTUnwrap(growth.correction).yawTenths, 120)
+
+        let reverse = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.05,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
+            speedMode: .turbo50x
+        )
+        XCTAssertTrue(reverse.requiresReversalStop)
+        XCTAssertNil(reverse.correction)
+    }
+
+    func testTravelBudgetsDoNotUndercutExpandedHardwareEnvelope() {
+        for mode in PersonTrackingSpeedMode.allCases {
+            XCTAssertGreaterThanOrEqual(
+                mode.yawTravelBudgetTenths,
+                OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees.right * 10
+            )
+            XCTAssertGreaterThanOrEqual(
+                mode.pitchTravelBudgetTenths,
+                OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees.down * 10
+            )
+        }
+        XCTAssertTrue(
+            PersonTrackingTravelBudgetPolicy.allowsCorrection(
+                nextYawTravelTenths: 45_000,
+                nextPitchTravelTenths: 45_000,
+                speedMode: .turbo50x
+            )
+        )
+        XCTAssertFalse(
+            PersonTrackingTravelBudgetPolicy.allowsCorrection(
+                nextYawTravelTenths: 45_001,
+                nextPitchTravelTenths: 45_000,
+                speedMode: .turbo50x
+            )
+        )
+        XCTAssertFalse(
+            PersonTrackingTravelBudgetPolicy.allowsSearch(
+                nextYawTravelTenths: 45_001,
+                nextPitchTravelTenths: 0,
+                speedMode: .turbo50x
+            )
+        )
+        XCTAssertFalse(
+            PersonTrackingTravelBudgetPolicy.allowsSearch(
+                nextYawTravelTenths: 0,
+                nextPitchTravelTenths: 45_001,
+                speedMode: .turbo50x
+            )
+        )
+    }
+
+    func testSpeedProfileMigrationRunsOnceThenPreservesManualChoice() {
+        XCTAssertEqual(
+            PersonTrackingSpeedSelectionPolicy.selection(
+                storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
+                storedProfileVersion: nil
+            ),
+            PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true)
+        )
+        XCTAssertEqual(
+            PersonTrackingSpeedSelectionPolicy.selection(
+                storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
+                storedProfileVersion: 1
+            ),
+            PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: false)
+        )
+        XCTAssertEqual(
+            PersonTrackingSpeedSelectionPolicy.selection(
+                storedRawValue: nil,
+                storedProfileVersion: 1
+            ),
+            PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true)
+        )
     }
 
     func testTrackingEnvelopeUsesAsymmetricDirectionalLimitsAndDiamond() {
@@ -560,14 +853,14 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertNil(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: 65, pitchTenths: 0),
-                currentYawTenths: 500,
+                currentYawTenths: 1_300,
                 currentPitchTenths: 0
             )
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0),
-                currentYawTenths: 500,
+                currentYawTenths: 1_300,
                 currentPitchTenths: 0
             ),
             PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0)
@@ -586,7 +879,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertEqual(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: 60, pitchTenths: 0),
-                currentYawTenths: 400,
+                currentYawTenths: 1_150,
                 currentPitchTenths: 0
             ),
             PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0)
@@ -594,14 +887,14 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertNil(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: 65, pitchTenths: 0),
-                currentYawTenths: 450,
+                currentYawTenths: 1_200,
                 currentPitchTenths: 0
             )
         )
         XCTAssertEqual(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0),
-                currentYawTenths: 450,
+                currentYawTenths: 1_200,
                 currentPitchTenths: 0
             ),
             PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0)
@@ -609,7 +902,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertEqual(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: -60, pitchTenths: 0),
-                currentYawTenths: -400,
+                currentYawTenths: -1_150,
                 currentPitchTenths: 0
             ),
             PersonTrackingCorrection(yawTenths: -50, pitchTenths: 0)
@@ -617,15 +910,15 @@ final class PersonTrackingPolicyTests: XCTestCase {
         XCTAssertEqual(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: 60, pitchTenths: 20),
-                currentYawTenths: 400,
+                currentYawTenths: 1_150,
                 currentPitchTenths: 0
             ),
-            PersonTrackingCorrection(yawTenths: 25, pitchTenths: 8)
+            PersonTrackingCorrection(yawTenths: 30, pitchTenths: 10)
         )
         XCTAssertNil(
             PersonTrackingPolicy.correctionClampedToNetSafetyBoundary(
                 PersonTrackingCorrection(yawTenths: 60, pitchTenths: 20),
-                currentYawTenths: 450,
+                currentYawTenths: 1_200,
                 currentPitchTenths: 0
             )
         )

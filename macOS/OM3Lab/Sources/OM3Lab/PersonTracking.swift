@@ -96,6 +96,62 @@ struct PersonVisionSample: Equatable, Sendable {
     }
 }
 
+/// Separates detector delivery from samples that are fresh enough to authorize
+/// motion. A delayed pipeline can still be producing frames, but those frames
+/// must never keep an automatic scan alive.
+enum PersonTrackingVisionMotionSafety: Equatable, Sendable {
+    case safe
+    case pipelineStalled
+    case samplesTooOld
+}
+
+struct PersonTrackingVisionHealth: Equatable, Sendable {
+    private(set) var lastPipelineActivityAtUptime: TimeInterval = 0
+    private(set) var lastMotionSafeSampleAtUptime: TimeInterval = 0
+
+    /// Records every delivered sample as pipeline activity, while only a sample
+    /// inside the active speed profile's age budget renews motion authority.
+    @discardableResult
+    mutating func record(
+        sampleObservedAtUptime: TimeInterval,
+        receivedAtUptime: TimeInterval,
+        maximumSampleAge: TimeInterval
+    ) -> Bool {
+        lastPipelineActivityAtUptime = receivedAtUptime
+        guard receivedAtUptime - sampleObservedAtUptime <= maximumSampleAge else {
+            return false
+        }
+        // Use receipt time after validating capture age. This keeps synthetic or
+        // slightly future timestamps from extending the scan authorization.
+        lastMotionSafeSampleAtUptime = receivedAtUptime
+        return true
+    }
+
+    func motionSafety(
+        at uptime: TimeInterval,
+        maximumSilence: TimeInterval
+    ) -> PersonTrackingVisionMotionSafety {
+        if lastMotionSafeSampleAtUptime > 0,
+           uptime - lastMotionSafeSampleAtUptime <= maximumSilence {
+            return .safe
+        }
+        if lastPipelineActivityAtUptime > 0,
+           uptime - lastPipelineActivityAtUptime <= maximumSilence {
+            return .samplesTooOld
+        }
+        return .pipelineStalled
+    }
+
+    /// Absolute deadline after which no motion may still be running without a
+    /// newer sample that passed the steering-age gate.
+    func motionAuthorizationDeadline(
+        maximumSilence: TimeInterval
+    ) -> TimeInterval? {
+        guard lastMotionSafeSampleAtUptime > 0 else { return nil }
+        return lastMotionSafeSampleAtUptime + maximumSilence
+    }
+}
+
 struct PersonCandidateID:
     Hashable,
     Comparable,
@@ -542,6 +598,27 @@ struct PersonTrackingCenteringState: Equatable, Sendable {
     var isFullyCentered: Bool { yawCentered && pitchCentered }
 }
 
+/// Axes held for one control cycle because they requested a small direction
+/// reversal. Consuming only those axes preserves useful history on the other
+/// axis while allowing the reversed axis to move on the next frame.
+struct PersonTrackingReversalAxes: OptionSet, Equatable, Sendable {
+    let rawValue: UInt8
+
+    static let yaw = PersonTrackingReversalAxes(rawValue: 1 << 0)
+    static let pitch = PersonTrackingReversalAxes(rawValue: 1 << 1)
+
+    func consuming(
+        _ previousCorrection: PersonTrackingCorrection?
+    ) -> PersonTrackingCorrection? {
+        guard let previousCorrection else { return nil }
+        let remaining = PersonTrackingCorrection(
+            yawTenths: contains(.yaw) ? 0 : previousCorrection.yawTenths,
+            pitchTenths: contains(.pitch) ? 0 : previousCorrection.pitchTenths
+        )
+        return remaining.isZero ? nil : remaining
+    }
+}
+
 /// The outcome of one control cycle. `correction == nil` means either both
 /// axes are centered (check `centering`) or a minor direction reversal was
 /// absorbed for one cycle; `requiresReversalStop` requests the full
@@ -550,6 +627,7 @@ struct PersonTrackingControlDecision: Equatable, Sendable {
     let correction: PersonTrackingCorrection?
     let centering: PersonTrackingCenteringState
     let requiresReversalStop: Bool
+    let minorReversalAxes: PersonTrackingReversalAxes
 }
 
 /// A four-direction travel envelope measured relative to the pose where tracking
@@ -569,12 +647,12 @@ struct GimbalTrackingEnvelope: Equatable, Sendable {
     let upPitchTenths: Int
     let downPitchTenths: Int
 
-    static let conservativeDefault = GimbalTrackingEnvelope(
-        leftYawTenths: 450,
-        rightYawTenths: 450,
-        upPitchTenths: 150,
-        downPitchTenths: 150
-    )
+    /// Range available after the operator confirms a centered, balanced
+    /// installation but before this exact installation has been calibrated.
+    /// Keeping it in the hardware policy prevents calibration and tracking from
+    /// silently drifting back to the old 45° / 15° box.
+    static let conservativeDefault =
+        OM3HardwareMotionLimits.centeredFallbackTrackingEnvelope
 
     init(
         leftYawTenths: Int,
@@ -622,18 +700,52 @@ struct GimbalTrackingEnvelope: Equatable, Sendable {
     }
 }
 
-enum PersonSearchDirection: Int, CaseIterable, Sendable {
-    case left = -1
-    case right = 1
+enum PersonSearchDirection: String, CaseIterable, Sendable {
+    case left
+    case right
+    case up
+    case down
 
     var opposite: PersonSearchDirection {
-        self == .left ? .right : .left
+        switch self {
+        case .left: return .right
+        case .right: return .left
+        case .up: return .down
+        case .down: return .up
+        }
+    }
+
+    /// Clockwise turns form an expanding square search around the last observed
+    /// target position. Unlike the old left/right bounce, every complete cycle
+    /// necessarily exercises both gimbal axes.
+    var clockwise: PersonSearchDirection {
+        switch self {
+        case .right: return .down
+        case .down: return .left
+        case .left: return .up
+        case .up: return .right
+        }
     }
 
     var title: String {
         switch self {
         case .left: return "向左"
         case .right: return "向右"
+        case .up: return "向上"
+        case .down: return "向下"
+        }
+    }
+
+    var unitCorrection: PersonTrackingCorrection {
+        switch self {
+        case .left:
+            return PersonTrackingCorrection(yawTenths: -1, pitchTenths: 0)
+        case .right:
+            return PersonTrackingCorrection(yawTenths: 1, pitchTenths: 0)
+        case .up:
+            return PersonTrackingCorrection(yawTenths: 0, pitchTenths: -1)
+        case .down:
+            return PersonTrackingCorrection(yawTenths: 0, pitchTenths: 1)
         }
     }
 }
@@ -643,9 +755,10 @@ enum PersonSearchMotionMode: String, CaseIterable, Sendable {
     case scan
 }
 
-struct PersonSearchStep: Equatable, Sendable {
-    let yawTenths: Int
-    let reachesSoftBoundary: Bool
+struct PersonSearchObservation: Equatable, Sendable {
+    let centerX: Double
+    let centerY: Double
+    let confidence: Float
 }
 
 /// Pure motion policy for reacquiring a person after they leave the camera frame.
@@ -656,21 +769,24 @@ enum PersonSearchPolicy {
     static let minimumOutwardTravel = 0.04
     static let minimumExitConfidence: Float = 0.65
 
-    static let coastStepTenths = 10
+    static let coastStepTenths = 20
     static let coastDurationTenths: UInt8 = 1
-    static let coastCooldown: TimeInterval = 0.23
+    static let coastCooldown: TimeInterval = 0.10
     static let lossGraceStopCooldown: TimeInterval = 0.12
-    static let maximumCoastTravelTenths = 20
+    static let maximumCoastTravelTenths = 60
 
-    static let scanSoftYawLimitTenths = 200
-    static let scanStepTenths = 20
-    static let scanDurationTenths: UInt8 = 3
-    static let scanCooldown: TimeInterval = 0.45
-    static let scanSettleDuration: TimeInterval = 0.30
-    static let maximumScanEpisodeDuration: TimeInterval = 12.0
-    static let maximumScanEpisodeTravelTenths = 600
-    static let maximumScanBoundaryTouches = 2
-
+    /// Reacquisition deliberately runs slower than the 120°/s tracking cap so
+    /// Vision still receives useful frames while crossing a candidate. Five
+    /// degrees per 0.1 s is 50°/s and has no application-added idle gap.
+    static let scanStepTenths = 50
+    static let scanDurationTenths: UInt8 = 1
+    static let scanCooldown: TimeInterval = 0.10
+    static let scanSettleDuration: TimeInterval = 0.12
+    /// These episode limits are deliberately broad enough for the expanded 2-D
+    /// envelope. The independent per-axis cumulative fuse is still checked on
+    /// every packet and cannot enlarge the hard pose boundary.
+    static let maximumScanEpisodeDuration: TimeInterval = 180.0
+    static let maximumScanEpisodeTravelTenths = 30_000
     static let commandMaximumAge: TimeInterval = 0.25
     static let commandRetryInterval: TimeInterval = 0.05
     static let maximumVisionSilence: TimeInterval = 0.50
@@ -687,99 +803,88 @@ enum PersonSearchPolicy {
     }
 
     static func coastDirection(
-        recentCenterXs: [Double],
-        lastConfidence: Float,
-        lastYawTenths: Int
+        recentObservations: [PersonSearchObservation],
+        lastCorrection: PersonTrackingCorrection
     ) -> PersonSearchDirection? {
-        let observations = Array(recentCenterXs.suffix(4))
+        let observations = Array(recentObservations.suffix(4))
         guard observations.count >= 3,
-              lastConfidence >= minimumExitConfidence,
-              lastYawTenths != 0,
+              (observations.last?.confidence ?? 0) >= minimumExitConfidence,
               let first = observations.first,
               let last = observations.last
         else { return nil }
 
-        let direction: PersonSearchDirection
-        if last <= exitEdgeThreshold {
-            direction = .left
-        } else if last >= 1 - exitEdgeThreshold {
-            direction = .right
-        } else {
-            return nil
+        let candidates = PersonSearchDirection.allCases.compactMap { direction
+            -> (direction: PersonSearchDirection, travel: Double, edgeDistance: Double)? in
+            let commandedComponent: Int
+            let firstCoordinate: Double
+            let lastCoordinate: Double
+            let coordinates: [Double]
+            let edgeDistance: Double
+            switch direction {
+            case .left:
+                commandedComponent = lastCorrection.yawTenths
+                firstCoordinate = first.centerX
+                lastCoordinate = last.centerX
+                coordinates = observations.map(\.centerX)
+                edgeDistance = last.centerX
+            case .right:
+                commandedComponent = lastCorrection.yawTenths
+                firstCoordinate = first.centerX
+                lastCoordinate = last.centerX
+                coordinates = observations.map(\.centerX)
+                edgeDistance = 1 - last.centerX
+            case .up:
+                commandedComponent = lastCorrection.pitchTenths
+                firstCoordinate = first.centerY
+                lastCoordinate = last.centerY
+                coordinates = observations.map(\.centerY)
+                edgeDistance = last.centerY
+            case .down:
+                commandedComponent = lastCorrection.pitchTenths
+                firstCoordinate = first.centerY
+                lastCoordinate = last.centerY
+                coordinates = observations.map(\.centerY)
+                edgeDistance = 1 - last.centerY
+            }
+
+            let sign = direction == .left || direction == .up ? -1.0 : 1.0
+            guard edgeDistance <= exitEdgeThreshold,
+                  Double(commandedComponent) * sign > 0
+            else { return nil }
+            let travel = sign * (lastCoordinate - firstCoordinate)
+            guard travel >= minimumOutwardTravel else { return nil }
+            for pair in zip(coordinates, coordinates.dropFirst()) {
+                guard sign * (pair.1 - pair.0) >= 0 else { return nil }
+            }
+            return (direction, travel, edgeDistance)
         }
-        let commandedDirection: PersonSearchDirection = lastYawTenths < 0 ? .left : .right
-        guard commandedDirection == direction else { return nil }
-        guard Double(direction.rawValue) * (last - first) >= minimumOutwardTravel else {
-            return nil
-        }
-        for pair in zip(observations, observations.dropFirst()) {
-            guard Double(direction.rawValue) * (pair.1 - pair.0) >= 0 else { return nil }
-        }
-        return direction
+        // A corner exit can satisfy two axes. Prefer the stronger observed
+        // outward motion, then the edge the person is closest to.
+        return candidates.max { lhs, rhs in
+            if abs(lhs.travel - rhs.travel) > 0.000_001 {
+                return lhs.travel < rhs.travel
+            }
+            return lhs.edgeDistance > rhs.edgeDistance
+        }?.direction
     }
 
-    static func coastStep(
-        currentYawTenths: Int,
-        direction: PersonSearchDirection
-    ) -> PersonSearchStep? {
-        boundedStep(
-            currentYawTenths: currentYawTenths,
-            direction: direction,
-            stepTenths: coastStepTenths
-        )
-    }
-
-    /// Returns one relative yaw command toward the requested soft boundary.
-    /// If an estimated position starts outside the soft range, only the
-    /// direction that first moves it back toward zero (and then across to the
-    /// opposite boundary) is accepted.
-    static func scanStep(
-        currentYawTenths: Int,
-        direction: PersonSearchDirection
-    ) -> PersonSearchStep? {
-        boundedStep(
-            currentYawTenths: currentYawTenths,
-            direction: direction,
-            stepTenths: scanStepTenths
-        )
-    }
-
-    private static func boundedStep(
-        currentYawTenths: Int,
+    static func requestedStep(
         direction: PersonSearchDirection,
-        stepTenths: Int
-    ) -> PersonSearchStep? {
-        let limit = scanSoftYawLimitTenths
+        mode: PersonSearchMotionMode
+    ) -> PersonTrackingCorrection {
+        let magnitude = mode == .coast ? coastStepTenths : scanStepTenths
+        let unit = direction.unitCorrection
+        return PersonTrackingCorrection(
+            yawTenths: unit.yawTenths * magnitude,
+            pitchTenths: unit.pitchTenths * magnitude
+        )
+    }
 
-        switch direction {
-        case .left:
-            let target = -limit
-            guard currentYawTenths > target else { return nil }
-            guard currentYawTenths <= target + stepTenths else {
-                return PersonSearchStep(
-                    yawTenths: -stepTenths,
-                    reachesSoftBoundary: false
-                )
-            }
-            return PersonSearchStep(
-                yawTenths: target - currentYawTenths,
-                reachesSoftBoundary: true
-            )
-
-        case .right:
-            let target = limit
-            guard currentYawTenths < target else { return nil }
-            guard currentYawTenths >= target - stepTenths else {
-                return PersonSearchStep(
-                    yawTenths: stepTenths,
-                    reachesSoftBoundary: false
-                )
-            }
-            return PersonSearchStep(
-                yawTenths: target - currentYawTenths,
-                reachesSoftBoundary: true
-            )
-        }
+    static func reachesEnvelopeBoundary(
+        requested: PersonTrackingCorrection,
+        submitted: PersonTrackingCorrection
+    ) -> Bool {
+        requested != submitted
     }
 }
 
@@ -787,6 +892,10 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
     case smooth = 0
     case standard = 1
     case fast = 2
+    /// Fifty times the nominal angular-rate profile of the smooth mode at the
+    /// same proportional-curve waypoints, capped by DJI's published OM3
+    /// maximum rotation speed. Software safety envelopes still clamp every move.
+    case turbo50x = 3
 
     var id: Int { rawValue }
 
@@ -794,11 +903,15 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth: return "平稳"
         case .standard: return "标准"
-        case .fast: return "连续极速 +200%"
+        case .fast: return "连续极速"
+        case .turbo50x: return "追踪 50×"
         }
     }
 
     var detail: String {
+        if self == .turbo50x {
+            return "相对平稳档目标 50× · OM3 官方 120°/s 封顶 · 无额外等待"
+        }
         if self == .fast {
             return "最大 \(formatTenths(combinedMaximumTenths))° / \(formatTenths(Int(commandDurationTenths))) 秒 · 应用无额外等待"
         }
@@ -810,6 +923,10 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 15
         case .standard: return 20
         case .fast: return 65
+        case .turbo50x:
+            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                durationTenths: commandDurationTenths
+            )
         }
     }
 
@@ -818,6 +935,7 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 10
         case .standard: return 15
         case .fast: return 20
+        case .turbo50x: return 91
         }
     }
 
@@ -828,6 +946,7 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth, .standard: return 3
         case .fast: return 5
+        case .turbo50x: return 28
         }
     }
 
@@ -835,6 +954,7 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth, .standard: return 10
         case .fast: return 35
+        case .turbo50x: return 91
         }
     }
 
@@ -843,13 +963,17 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 15
         case .standard: return 20
         case .fast: return 65
+        case .turbo50x:
+            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                durationTenths: commandDurationTenths
+            )
         }
     }
 
     var commandDurationTenths: UInt8 {
         switch self {
         case .smooth, .standard: return 3
-        case .fast: return 1
+        case .fast, .turbo50x: return 1
         }
     }
 
@@ -857,14 +981,44 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth: return 0.55
         case .standard: return 0.45
-        case .fast: return 0.10
+        case .fast, .turbo50x: return 0.10
         }
     }
 
     var maximumSampleAge: TimeInterval {
         switch self {
         case .smooth, .standard: return 0.25
-        case .fast: return 0.10
+        case .fast, .turbo50x: return 0.10
+        }
+    }
+
+    /// Growth remains smoothed in the legacy profiles. The 50x profile scales
+    /// the full response, so an existing small same-direction command cannot
+    /// silently hold it at legacy acceleration for another 0.7 seconds.
+    var correctionGrowthLimitTenths: Int {
+        switch self {
+        case .smooth, .standard, .fast: return PersonTrackingPolicy.slewLimitTenths
+        case .turbo50x:
+            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
+                durationTenths: commandDurationTenths
+            )
+        }
+    }
+
+    /// Cumulative fuses catch prolonged oscillation and cable fatigue without
+    /// undercutting the expanded net pose envelope. They do not enlarge the
+    /// pose boundary: every command is still clipped to the calibrated diamond.
+    var yawTravelBudgetTenths: Int {
+        switch self {
+        case .smooth, .standard, .fast: return 12_000
+        case .turbo50x: return 45_000
+        }
+    }
+
+    var pitchTravelBudgetTenths: Int {
+        switch self {
+        case .smooth, .standard, .fast: return 12_000
+        case .turbo50x: return 45_000
         }
     }
 
@@ -873,13 +1027,70 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
+struct PersonTrackingSpeedSelection: Equatable, Sendable {
+    let mode: PersonTrackingSpeedMode
+    let requiresWriteback: Bool
+}
+
+enum PersonTrackingSpeedSelectionPolicy {
+    static let currentProfileVersion = 1
+
+    /// Upgrade every pre-50x installation once, then preserve subsequent user
+    /// choices exactly. Invalid or missing values fail toward the requested
+    /// 50x profile and are normalized back to UserDefaults.
+    static func selection(
+        storedRawValue: Int?,
+        storedProfileVersion: Int?
+    ) -> PersonTrackingSpeedSelection {
+        guard (storedProfileVersion ?? 0) >= currentProfileVersion,
+              let storedRawValue,
+              let storedMode = PersonTrackingSpeedMode(rawValue: storedRawValue)
+        else {
+            return PersonTrackingSpeedSelection(
+                mode: .turbo50x,
+                requiresWriteback: true
+            )
+        }
+        return PersonTrackingSpeedSelection(
+            mode: storedMode,
+            requiresWriteback: false
+        )
+    }
+}
+
+enum PersonTrackingTravelBudgetPolicy {
+    static func allowsCorrection(
+        nextYawTravelTenths: Int,
+        nextPitchTravelTenths: Int,
+        speedMode: PersonTrackingSpeedMode
+    ) -> Bool {
+        nextYawTravelTenths <= speedMode.yawTravelBudgetTenths
+            && nextPitchTravelTenths <= speedMode.pitchTravelBudgetTenths
+    }
+
+    static func allowsSearch(
+        nextYawTravelTenths: Int,
+        nextPitchTravelTenths: Int,
+        speedMode: PersonTrackingSpeedMode
+    ) -> Bool {
+        allowsCorrection(
+            nextYawTravelTenths: nextYawTravelTenths,
+            nextPitchTravelTenths: nextPitchTravelTenths,
+            speedMode: speedMode
+        )
+    }
+}
+
 enum PersonTrackingPolicy {
     static let horizontalDeadZone = 0.12
-    static let verticalDeadZone = 0.15
+    // The upper-body head anchor is already filtered independently. The old
+    // ±15% vertical band hid ordinary standing/crouching motion and made Pitch
+    // appear disabled, so vertical control uses a visibly tighter hysteresis.
+    static let verticalDeadZone = 0.08
     /// Inner (re-entry) dead zones for the hysteresis: once correcting, an
     /// axis keeps correcting until the error falls inside these.
     static let horizontalInnerDeadZone = 0.07
-    static let verticalInnerDeadZone = 0.09
+    static let verticalInnerDeadZone = 0.04
     /// Vertical control anchors on the head — a quarter of the way down the
     /// upper-body box — because the box center jumps when arms raise or the
     /// posture changes. Target 0.32 plus the anchor offset reproduces the
@@ -1056,14 +1267,15 @@ enum PersonTrackingPolicy {
             wasCentered: centering.pitchCentered,
             innerDeadZone: verticalInnerDeadZone,
             outerDeadZone: verticalDeadZone,
-            mediumThreshold: 0.25,
-            largeThreshold: 0.38,
+            mediumThreshold: 0.16,
+            largeThreshold: 0.28,
             minimumTenths: speedMode.minimumStepTenths,
             mediumTenths: speedMode.mediumStepTenths,
             maximumTenths: speedMode.pitchMaximumTenths
         )
         var yaw = yawStep.tenths
         var pitch = pitchStep.tenths
+        var minorReversalAxes: PersonTrackingReversalAxes = []
         let newCentering = PersonTrackingCenteringState(
             yawCentered: yawStep.isCentered,
             pitchCentered: pitchStep.isCentered
@@ -1077,15 +1289,30 @@ enum PersonTrackingPolicy {
                 return PersonTrackingControlDecision(
                     correction: nil,
                     centering: newCentering,
-                    requiresReversalStop: true
+                    requiresReversalStop: true,
+                    minorReversalAxes: []
                 )
             }
             // A minor reversal is absorbed by holding that axis for one cycle:
             // the previous burst decays inside the OM3 without a hard STOP.
-            if yawReverses { yaw = 0 }
-            if pitchReverses { pitch = 0 }
-            yaw = slewLimited(yaw, previous: previous.yawTenths)
-            pitch = slewLimited(pitch, previous: previous.pitchTenths)
+            if yawReverses {
+                yaw = 0
+                minorReversalAxes.insert(.yaw)
+            }
+            if pitchReverses {
+                pitch = 0
+                minorReversalAxes.insert(.pitch)
+            }
+            yaw = slewLimited(
+                yaw,
+                previous: previous.yawTenths,
+                maximumGrowthTenths: speedMode.correctionGrowthLimitTenths
+            )
+            pitch = slewLimited(
+                pitch,
+                previous: previous.pitchTenths,
+                maximumGrowthTenths: speedMode.correctionGrowthLimitTenths
+            )
         }
 
         let limited = limitCombinedMagnitude(
@@ -1100,7 +1327,8 @@ enum PersonTrackingPolicy {
         return PersonTrackingControlDecision(
             correction: correction.isZero ? nil : correction,
             centering: newCentering,
-            requiresReversalStop: false
+            requiresReversalStop: false,
+            minorReversalAxes: minorReversalAxes
         )
     }
 
@@ -1121,8 +1349,12 @@ enum PersonTrackingPolicy {
 
     /// Only magnitude growth is limited; decaying toward zero must always be
     /// allowed so the gimbal can stop within one cycle.
-    private static func slewLimited(_ next: Int, previous: Int) -> Int {
-        let allowedMagnitude = abs(previous) + slewLimitTenths
+    private static func slewLimited(
+        _ next: Int,
+        previous: Int,
+        maximumGrowthTenths: Int
+    ) -> Int {
+        let allowedMagnitude = abs(previous) + maximumGrowthTenths
         guard abs(next) > allowedMagnitude else { return next }
         return next < 0 ? -allowedMagnitude : allowedMagnitude
     }
@@ -1195,11 +1427,12 @@ enum PersonTrackingPolicy {
         maximumTenths: Int
     ) -> (tenths: Int, isCentered: Bool) {
         let magnitude = abs(error)
+        let comparisonEpsilon = 0.000_000_001
         // Hysteresis: leaving the centered regime needs the outer dead zone;
         // returning to it needs the inner one.
         if wasCentered {
-            guard magnitude > outerDeadZone else { return (0, true) }
-        } else if magnitude <= innerDeadZone {
+            guard magnitude > outerDeadZone + comparisonEpsilon else { return (0, true) }
+        } else if magnitude <= innerDeadZone + comparisonEpsilon {
             return (0, true)
         }
 
@@ -1216,7 +1449,7 @@ enum PersonTrackingPolicy {
             let ramp = (magnitude - mediumThreshold)
                 / max(largeThreshold - mediumThreshold, 0.000_001)
             step = Double(medium) + ramp * Double(maximumTenths - medium)
-        } else if magnitude > outerDeadZone {
+        } else if magnitude > outerDeadZone + comparisonEpsilon {
             let ramp = (magnitude - outerDeadZone)
                 / max(mediumThreshold - outerDeadZone, 0.000_001)
             step = Double(minimum) + ramp * Double(medium - minimum)
