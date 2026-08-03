@@ -667,6 +667,10 @@ private struct ControlPanel: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(calibration.envelopeIsActive ? .green : .cyan)
 
+            Text(calibrationCeilingText)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+
             if calibration.isRunning {
                 ProgressView(value: calibration.progress)
                     .tint(.cyan)
@@ -880,6 +884,12 @@ private struct ControlPanel: View {
         }
         let fallback = OM3HardwareMotionLimits.centeredFallbackEnvelopeDegrees
         return "未标定回中硬边界：左/右各 \(fallback.left)° · 上/下各 \(fallback.up)°；全向验证后按四个方向分别扩大"
+    }
+
+    private var calibrationCeilingText: String {
+        let probe = OM3HardwareMotionLimits.probeCapsDegrees
+        let tracking = OM3HardwareMotionLimits.maximumCalibratedEnvelopeDegrees
+        return "App 探测上限 左/右/上/下 \(probe.left)°/\(probe.right)°/\(probe.up)°/\(probe.down)°；扣除余量后的跟踪最大值 \(tracking.left)°/\(tracking.right)°/\(tracking.up)°/\(tracking.down)°"
     }
 
     private func degreeText(_ tenths: Int) -> String {

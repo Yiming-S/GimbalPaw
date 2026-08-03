@@ -1395,7 +1395,10 @@ final class PersonTrackingCoordinator: ObservableObject {
         recentSearchObservations.append(
             PersonSearchObservation(
                 centerX: detection.centerX,
-                centerY: detection.centerY,
+                // Vertical control and exit inference must use the same head
+                // anchor. A tall person's box center can remain far from the
+                // image edge even after their head has already left the frame.
+                centerY: PersonTrackingPolicy.headAnchorY(for: detection),
                 confidence: detection.confidence
             )
         )

@@ -231,8 +231,8 @@ do {
         "50x tracking must scale the near-error proportional waypoint"
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .turbo50x)?.yawTenths == 114,
-        "50x tracking must scale the medium-error proportional waypoint"
+        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .turbo50x)?.yawTenths == 106,
+        "50x tracking must scale the medium-error waypoint below the hardware cap"
     )
     let previousContinuousMaximumRate = 45.0 / 0.21
     let upgradedMaximumRate = Double(PersonTrackingSpeedMode.fast.yawMaximumTenths)
@@ -264,7 +264,8 @@ do {
     let turboPitchRate = Double(PersonTrackingSpeedMode.turbo50x.pitchMaximumTenths)
         / PersonTrackingSpeedMode.turbo50x.commandCooldown
     expect(
-        turboYawRate == OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond,
+        turboYawRate
+            == Double(OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond),
         "50x yaw must saturate exactly at DJI's published OM3 speed ceiling"
     )
     expect(

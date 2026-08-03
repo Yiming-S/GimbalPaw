@@ -576,7 +576,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
                 for: detection(centerX: 0.78, centerY: 0.5),
                 speedMode: .turbo50x
             ),
-            PersonTrackingCorrection(yawTenths: 114, pitchTenths: 0)
+            PersonTrackingCorrection(yawTenths: 106, pitchTenths: 0)
         )
 
         for mode in PersonTrackingSpeedMode.allCases {
