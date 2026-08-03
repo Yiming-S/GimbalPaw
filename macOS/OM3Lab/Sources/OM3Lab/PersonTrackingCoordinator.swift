@@ -1,6 +1,15 @@
 import Combine
 import Foundation
 
+/// One entry in the human-readable tracking timeline. Raw BLE logs stay in the
+/// advanced section; these are the key transitions an operator actually reads.
+struct PersonTrackingEvent: Identifiable, Equatable, Sendable {
+    let id: UInt64
+    let date: Date
+    let title: String
+    let symbol: String
+}
+
 enum PersonTrackingState: Equatable {
     case off
     case awaitingSelection(Int)
@@ -64,6 +73,9 @@ private enum PersonTrackingPhase: Equatable {
 final class PersonTrackingCoordinator: ObservableObject {
     private static let speedModeDefaultsKey = "personTracking.speedMode"
     private static let speedProfileVersionKey = "personTracking.speedProfileVersion"
+    private static let compositionHorizontalKey = "personTracking.composition.horizontalTarget"
+    private static let compositionHeadAnchorKey = "personTracking.composition.headAnchorTarget"
+    private static let compositionLeadRoomKey = "personTracking.composition.leadRoom"
     private static let reacquisitionFrames = 5
     private static let reacquisitionDuration: TimeInterval = 0.40
     private static let reacquisitionMinimumConfidence: Float = 0.65
@@ -78,6 +90,11 @@ final class PersonTrackingCoordinator: ObservableObject {
     // Manual willSet publication only wakes observers on real changes.
     private(set) var state: PersonTrackingState = .off {
         willSet { if newValue != state { objectWillChange.send() } }
+        didSet { if oldValue != state { recordTimelineEvent(for: state) } }
+    }
+    /// Key transitions for the UI timeline; capped, newest first.
+    private(set) var recentEvents: [PersonTrackingEvent] = [] {
+        willSet { if newValue != recentEvents { objectWillChange.send() } }
     }
     private(set) var canResumeSearch = false {
         willSet { if newValue != canResumeSearch { objectWillChange.send() } }
@@ -93,6 +110,15 @@ final class PersonTrackingCoordinator: ObservableObject {
     }
     private(set) var hasAnalyzedPeopleFrame = false {
         willSet { if newValue != hasAnalyzedPeopleFrame { objectWillChange.send() } }
+    }
+    /// The most recently submitted correction, kept only while its burst may
+    /// still be moving the gimbal. Drives the preview HUD arrow.
+    private(set) var displayedCorrection: PersonTrackingCorrection? {
+        willSet { if newValue != displayedCorrection { objectWillChange.send() } }
+    }
+    /// User framing preferences; applied live and persisted across launches.
+    private(set) var composition = PersonTrackingComposition.default {
+        willSet { if newValue != composition { objectWillChange.send() } }
     }
 
     var canChangePersonSelection: Bool {
@@ -181,6 +207,31 @@ final class PersonTrackingCoordinator: ObservableObject {
             )
         }
 
+        var storedComposition = PersonTrackingComposition.default
+        if let horizontal = defaults.object(
+            forKey: Self.compositionHorizontalKey
+        ) as? NSNumber {
+            storedComposition.horizontalTarget = min(
+                0.8,
+                max(0.2, horizontal.doubleValue)
+            )
+        }
+        if let headAnchor = defaults.object(
+            forKey: Self.compositionHeadAnchorKey
+        ) as? NSNumber {
+            storedComposition.headAnchorTarget = min(
+                PersonTrackingComposition.headAnchorTargetRange.upperBound,
+                max(
+                    PersonTrackingComposition.headAnchorTargetRange.lowerBound,
+                    headAnchor.doubleValue
+                )
+            )
+        }
+        storedComposition.leadRoomEnabled = defaults.bool(
+            forKey: Self.compositionLeadRoomKey
+        )
+        composition = storedComposition
+
         bluetooth.statePublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] state in
@@ -266,6 +317,25 @@ final class PersonTrackingCoordinator: ObservableObject {
         } else {
             disable(reason: "人物跟踪已关闭", sendStop: true)
         }
+    }
+
+    /// Composition may change while tracking runs: the target simply moves and
+    /// the next control cycle reframes toward it.
+    func setComposition(_ newComposition: PersonTrackingComposition) {
+        var bounded = newComposition
+        bounded.horizontalTarget = min(0.8, max(0.2, bounded.horizontalTarget))
+        bounded.headAnchorTarget = min(
+            PersonTrackingComposition.headAnchorTargetRange.upperBound,
+            max(
+                PersonTrackingComposition.headAnchorTargetRange.lowerBound,
+                bounded.headAnchorTarget
+            )
+        )
+        composition = bounded
+        let defaults = UserDefaults.standard
+        defaults.set(bounded.horizontalTarget, forKey: Self.compositionHorizontalKey)
+        defaults.set(bounded.headAnchorTarget, forKey: Self.compositionHeadAnchorKey)
+        defaults.set(bounded.leadRoomEnabled, forKey: Self.compositionLeadRoomKey)
     }
 
     func setSpeedMode(_ mode: PersonTrackingSpeedMode) {
@@ -764,6 +834,7 @@ final class PersonTrackingCoordinator: ObservableObject {
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
         visualCorrectionMayBeActive = false
+        displayedCorrection = nil
         lastSearchCorrection = nil
         recentSearchObservations.removeAll(keepingCapacity: true)
         state = .locked
@@ -806,7 +877,8 @@ final class PersonTrackingCoordinator: ObservableObject {
             velocityY: controlFilterY.velocity,
             centering: centeringState,
             previousCorrection: lastSubmittedCorrection,
-            speedMode: sessionSpeedMode
+            speedMode: sessionSpeedMode,
+            composition: composition
         )
         centeringState = decision.centering
         if !decision.minorReversalAxes.isEmpty {
@@ -949,6 +1021,7 @@ final class PersonTrackingCoordinator: ObservableObject {
     private func acceptSubmittedCorrection(_ correction: PersonTrackingCorrection) {
         lastSubmittedCorrection = correction
         visualCorrectionMayBeActive = true
+        displayedCorrection = correction
         lastSearchCorrection = correction
         if abs(correction.pitchTenths) > abs(correction.yawTenths) {
             if correction.pitchTenths > 0 {
@@ -1104,6 +1177,10 @@ final class PersonTrackingCoordinator: ObservableObject {
             PersonSearchPolicy.scanSettleDuration,
             speedMode.commandCooldown
         )
+        // Scanning may only be authorized by fresh vision that arrived after
+        // this search (or search leg) began: authority granted while the
+        // target was still tracked must not carry into an unattended sweep.
+        let episodeAuthorizationFloor = ProcessInfo.processInfo.systemUptime
         searchTask = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: Self.nanoseconds(initialDelay))
@@ -1111,6 +1188,7 @@ final class PersonTrackingCoordinator: ObservableObject {
                 return
             }
             var busyStartedAtUptime: TimeInterval?
+            var visionUnsafeSinceUptime: TimeInterval?
             while !Task.isCancelled {
                 guard let self,
                       self.enabled,
@@ -1123,37 +1201,58 @@ final class PersonTrackingCoordinator: ObservableObject {
                 let scanDuration = Double(PersonSearchPolicy.scanDurationTenths) / 10.0
                 let episodeDeadline = self.searchEpisodeStartedAtUptime
                     + PersonSearchPolicy.maximumScanEpisodeDuration
+
+                // No step may start unless fresh post-episode vision covers
+                // its whole duration. An unauthorized stretch first gets a
+                // short idle grace (nothing is sent while waiting) so a
+                // transient delivery gap does not end the episode; only a
+                // persistent one pauses it.
+                let visionDeadline = self.visionHealth.motionAuthorizationDeadline(
+                    maximumSilence: PersonSearchPolicy.maximumVisionSilence
+                )
+                let unauthorizedReason: String?
                 switch self.visionHealth.motionSafety(
                     at: now,
                     maximumSilence: PersonSearchPolicy.maximumVisionSilence
                 ) {
                 case .safe:
-                    break
+                    if let visionDeadline,
+                       now + scanDuration <= visionDeadline,
+                       self.visionHealth.lastMotionSafeSampleAtUptime
+                            >= episodeAuthorizationFloor {
+                        unauthorizedReason = nil
+                    } else {
+                        unauthorizedReason = "新鲜画面授权不足以完成下一步扫描，扫描保持静止"
+                    }
                 case .pipelineStalled:
-                    self.pauseAutomaticMotion(
-                        reason: "摄像头画面已停滞，扫描保持静止",
-                        resumable: true
-                    )
-                    return
+                    unauthorizedReason = "摄像头画面已停滞，扫描保持静止"
                 case .samplesTooOld:
-                    self.pauseAutomaticMotion(
-                        reason: "摄像头画面延迟过高，扫描保持静止",
-                        resumable: true
-                    )
-                    return
+                    unauthorizedReason = "摄像头画面延迟过高，扫描保持静止"
                 }
-                guard let visionDeadline = self.visionHealth
-                    .motionAuthorizationDeadline(
-                        maximumSilence: PersonSearchPolicy.maximumVisionSilence
-                    ),
-                    now + scanDuration <= visionDeadline
-                else {
-                    self.pauseAutomaticMotion(
-                        reason: "新鲜画面授权不足以完成下一步扫描，扫描保持静止",
-                        resumable: true
-                    )
-                    return
+                if let unauthorizedReason {
+                    let unsafeSince = visionUnsafeSinceUptime ?? now
+                    visionUnsafeSinceUptime = unsafeSince
+                    guard now - unsafeSince
+                        <= PersonSearchPolicy.maximumVisionSilence else {
+                        self.pauseAutomaticMotion(
+                            reason: unauthorizedReason,
+                            resumable: true
+                        )
+                        return
+                    }
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: Self.nanoseconds(
+                                PersonSearchPolicy.commandRetryInterval
+                            )
+                        )
+                    } catch {
+                        return
+                    }
+                    continue
                 }
+                visionUnsafeSinceUptime = nil
+                guard let visionDeadline else { continue }
                 if now + scanDuration > episodeDeadline
                     || self.searchEpisodeTravelTenths
                         + PersonSearchPolicy.scanStepTenths
@@ -1391,6 +1490,80 @@ final class PersonTrackingCoordinator: ObservableObject {
         )
     }
 
+    private var lastTimelineSignature = ""
+    private var nextTimelineEventID: UInt64 = 1
+
+    /// Collapses the high-frequency following states into one timeline entry
+    /// and only records a new row when the story actually changes.
+    private func recordTimelineEvent(for state: PersonTrackingState) {
+        let signature: String
+        let title: String
+        let symbol: String
+        switch state {
+        case .off:
+            signature = "off"
+            title = "人物跟踪已关闭"
+            symbol = "power"
+        case .awaitingSelection:
+            signature = "awaiting"
+            title = "等待选择目标"
+            symbol = "person.crop.circle.badge.questionmark"
+        case .acquiring:
+            signature = "acquiring"
+            title = "正在稳定锁定人物"
+            symbol = "scope"
+        case .locked, .correcting, .centered:
+            signature = "following"
+            title = "跟随中"
+            symbol = "person.fill.viewfinder"
+        case .lossGrace:
+            signature = "lost"
+            title = "目标出框"
+            symbol = "eye.slash"
+        case .coasting:
+            signature = "coasting"
+            title = "沿离场方向惯性寻找"
+            symbol = "arrow.right.circle"
+        case .searching, .scanning:
+            signature = "scanning"
+            title = "自动扫描寻找目标"
+            symbol = "magnifyingglass"
+        case .reacquiring:
+            signature = "reacquiring"
+            title = "发现候选，正在稳定重锁"
+            symbol = "person.badge.clock"
+        case let .searchPaused(reason):
+            signature = "searchPaused:\(reason)"
+            title = "扫描暂停：\(reason)"
+            symbol = "pause.circle"
+        case let .motionPaused(reason):
+            signature = "motionPaused:\(reason)"
+            title = "运动暂停：\(reason)"
+            symbol = "exclamationmark.octagon"
+        case let .unavailable(reason):
+            signature = "unavailable:\(reason)"
+            title = reason
+            symbol = "exclamationmark.triangle"
+        }
+        guard signature != lastTimelineSignature else { return }
+        lastTimelineSignature = signature
+        var events = recentEvents
+        events.insert(
+            PersonTrackingEvent(
+                id: nextTimelineEventID,
+                date: Date(),
+                title: title,
+                symbol: symbol
+            ),
+            at: 0
+        )
+        nextTimelineEventID &+= 1
+        if events.count > 50 {
+            events.removeLast(events.count - 50)
+        }
+        recentEvents = events
+    }
+
     private func recordSearchObservation(_ detection: PersonDetection) {
         recentSearchObservations.append(
             PersonSearchObservation(
@@ -1463,6 +1636,7 @@ final class PersonTrackingCoordinator: ObservableObject {
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
         visualCorrectionMayBeActive = false
+        displayedCorrection = nil
         lastSearchCorrection = nil
         recentSearchObservations.removeAll(keepingCapacity: true)
         lastKnownDirection = .right
@@ -1508,6 +1682,7 @@ final class PersonTrackingCoordinator: ObservableObject {
             return false
         }
         visualCorrectionMayBeActive = false
+        displayedCorrection = nil
         lastSubmittedCorrection = nil
         return true
     }
@@ -1527,6 +1702,7 @@ final class PersonTrackingCoordinator: ObservableObject {
         reversalBlockedUntilUptime = 0
         lastSubmittedCorrection = nil
         visualCorrectionMayBeActive = false
+        displayedCorrection = nil
         lastSearchCorrection = nil
         recentSearchObservations.removeAll(keepingCapacity: true)
         lastKnownDirection = .right

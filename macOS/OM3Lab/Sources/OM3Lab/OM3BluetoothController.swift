@@ -119,6 +119,86 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "om3.verboseLogging")
     }
 
+    /// FFF4 capture: collects raw notification payloads for offline protocol
+    /// analysis (the first step toward decoding attitude telemetry).
+    @Published private(set) var rxCaptureActive = false
+    @Published private(set) var rxCaptureFrameCount = 0
+    private var rxCaptureFrames: [(receivedAt: Date, payload: Data)] = []
+    private var rxCaptureToken = UUID()
+    private static let rxCaptureFrameLimit = 5_000
+
+    func startRXCapture(duration: TimeInterval = 30) {
+        rxCaptureFrames.removeAll(keepingCapacity: true)
+        rxCaptureFrameCount = 0
+        rxCaptureActive = true
+        let token = UUID()
+        rxCaptureToken = token
+        appendLog("已开始 FFF4 抓包（最长 \(Int(duration)) 秒或 \(Self.rxCaptureFrameLimit) 帧）。")
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            guard let self,
+                  self.rxCaptureToken == token,
+                  self.rxCaptureActive
+            else { return }
+            _ = self.finishRXCaptureAndExport()
+        }
+    }
+
+    @discardableResult
+    func finishRXCaptureAndExport() -> URL? {
+        guard rxCaptureActive else { return nil }
+        rxCaptureActive = false
+        let frames = rxCaptureFrames
+        rxCaptureFrames.removeAll(keepingCapacity: false)
+        guard !frames.isEmpty else {
+            appendLog("抓包结束：期间没有收到任何 FFF4 通知。")
+            return nil
+        }
+        let stampFormatter = DateFormatter()
+        stampFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        var lines = [
+            "# OM3 Lab FFF4 RX capture",
+            "# exported \(stampFormatter.string(from: Date()))",
+            "# device: \(rememberedDeviceName ?? "unknown")",
+            "# format: <received-at>\\t<hex payload>",
+        ]
+        for frame in frames {
+            lines.append(
+                "\(stampFormatter.string(from: frame.receivedAt))\t\(OM3Protocol.hex(frame.payload))"
+            )
+        }
+        let nameFormatter = DateFormatter()
+        nameFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        guard let downloads = FileManager.default.urls(
+            for: .downloadsDirectory,
+            in: .userDomainMask
+        ).first else {
+            appendLog("抓包导出失败：找不到下载目录。")
+            return nil
+        }
+        let url = downloads.appendingPathComponent(
+            "OM3Lab-RX-\(nameFormatter.string(from: Date())).txt"
+        )
+        do {
+            try lines.joined(separator: "\n")
+                .write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            appendLog("抓包导出失败：\(error.localizedDescription)")
+            return nil
+        }
+        appendLog("已导出 \(frames.count) 条 FFF4 通知：\(url.lastPathComponent)")
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+        return url
+    }
+
+    fileprivate func captureRXFrameIfNeeded(_ value: Data) {
+        guard rxCaptureActive else { return }
+        rxCaptureFrames.append((receivedAt: Date(), payload: value))
+        rxCaptureFrameCount = rxCaptureFrames.count
+        if rxCaptureFrames.count >= Self.rxCaptureFrameLimit {
+            _ = finishRXCaptureAndExport()
+        }
+    }
+
     private enum PacketCompletion {
         case none
         case manual(token: UUID, delay: TimeInterval)
@@ -1352,16 +1432,28 @@ final class OM3BluetoothController: NSObject, ObservableObject {
         trackingPitchBudgetTenths = 0
         trackingYawTravelTenths = 0
         trackingPitchTravelTenths = 0
+        estimatedPoseTenths = PersonTrackingCorrection(yawTenths: 0, pitchTenths: 0)
     }
 
     /// Motion budgets describe frames whose complete 21 bytes were handed to
     /// CoreBluetooth. A packet dropped before its first byte, or replaced by a
     /// higher-priority STOP, must never move this estimate.
+    /// Command-integration pose estimate published for the envelope diagram.
+    /// This is bookkeeping, not measured attitude — the OM3 reports nothing.
+    @Published private(set) var estimatedPoseTenths = PersonTrackingCorrection(
+        yawTenths: 0,
+        pitchTenths: 0
+    )
+
     private func commitTrackingMotion(_ delta: PersonTrackingCorrection) {
         trackingYawBudgetTenths += delta.yawTenths
         trackingPitchBudgetTenths += delta.pitchTenths
         trackingYawTravelTenths += abs(delta.yawTenths)
         trackingPitchTravelTenths += abs(delta.pitchTenths)
+        estimatedPoseTenths = PersonTrackingCorrection(
+            yawTenths: trackingYawBudgetTenths,
+            pitchTenths: trackingPitchBudgetTenths
+        )
     }
 
     private func invalidateRangeCalibration() {
@@ -1707,6 +1799,7 @@ extension OM3BluetoothController: CBPeripheralDelegate {
             return
         }
         guard let value = characteristic.value else { return }
+        captureRXFrameIfNeeded(value)
         if verboseLogging {
             appendLog("RX FFF4 · \(OM3Protocol.hex(value, limit: 24))")
         }

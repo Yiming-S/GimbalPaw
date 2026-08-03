@@ -140,6 +140,88 @@ private enum CameraEngineEvent: Sendable {
         runningDeviceID: String?,
         allowsAutomaticRetry: Bool
     )
+    case recordingStarted(url: URL)
+    case recordingFinished(url: URL, errorMessage: String?)
+    case photoSaved(url: URL)
+    case captureFailed(message: String)
+}
+
+/// Retained by the engine for the duration of one movie recording.
+private final class MovieRecordingDelegate:
+    NSObject,
+    AVCaptureFileOutputRecordingDelegate,
+    @unchecked Sendable
+{
+    private let onEvent: @Sendable (CameraEngineEvent) -> Void
+
+    init(onEvent: @escaping @Sendable (CameraEngineEvent) -> Void) {
+        self.onEvent = onEvent
+    }
+
+    func fileOutput(
+        _ output: AVCaptureFileOutput,
+        didStartRecordingTo fileURL: URL,
+        from connections: [AVCaptureConnection]
+    ) {
+        onEvent(.recordingStarted(url: fileURL))
+    }
+
+    func fileOutput(
+        _ output: AVCaptureFileOutput,
+        didFinishRecordingTo outputFileURL: URL,
+        from connections: [AVCaptureConnection],
+        error: Error?
+    ) {
+        onEvent(
+            .recordingFinished(
+                url: outputFileURL,
+                errorMessage: error?.localizedDescription
+            )
+        )
+    }
+}
+
+/// Retained by the engine until its single capture completes.
+private final class PhotoCaptureDelegate:
+    NSObject,
+    AVCapturePhotoCaptureDelegate,
+    @unchecked Sendable
+{
+    private let destination: URL
+    private let onEvent: @Sendable (CameraEngineEvent) -> Void
+    private let onComplete: @Sendable (PhotoCaptureDelegate) -> Void
+
+    init(
+        destination: URL,
+        onEvent: @escaping @Sendable (CameraEngineEvent) -> Void,
+        onComplete: @escaping @Sendable (PhotoCaptureDelegate) -> Void
+    ) {
+        self.destination = destination
+        self.onEvent = onEvent
+        self.onComplete = onComplete
+    }
+
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        didFinishProcessingPhoto photo: AVCapturePhoto,
+        error: Error?
+    ) {
+        defer { onComplete(self) }
+        if let error {
+            onEvent(.captureFailed(message: "拍照失败：\(error.localizedDescription)"))
+            return
+        }
+        guard let data = photo.fileDataRepresentation() else {
+            onEvent(.captureFailed(message: "拍照失败：无法生成图像数据"))
+            return
+        }
+        do {
+            try data.write(to: destination, options: .atomic)
+            onEvent(.photoSaved(url: destination))
+        } catch {
+            onEvent(.captureFailed(message: "照片保存失败：\(error.localizedDescription)"))
+        }
+    }
 }
 
 private final class CameraCaptureEngine: @unchecked Sendable {
@@ -171,6 +253,10 @@ private final class CameraCaptureEngine: @unchecked Sendable {
         position: .unspecified
     )
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let movieOutput = AVCaptureMovieFileOutput()
+    private let photoOutput = AVCapturePhotoOutput()
+    private var movieRecordingDelegate: MovieRecordingDelegate?
+    private var pendingPhotoDelegates: [PhotoCaptureDelegate] = []
     private let personAnalyzer = PersonVisionAnalyzer()
     private let inputStateLock = NSLock()
     private var currentInput: AVCaptureDeviceInput?
@@ -324,11 +410,67 @@ private final class CameraCaptureEngine: @unchecked Sendable {
         personAnalyzer.setMotionSession(lease)
     }
 
+    func startRecording(to url: URL) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.session.isRunning,
+                  self.session.outputs.contains(where: { $0 === self.movieOutput }),
+                  !self.movieOutput.isRecording
+            else {
+                self.emit(.captureFailed(message: "录制不可用：预览未运行或该设备不支持录制输出"))
+                return
+            }
+            let delegate = MovieRecordingDelegate { [weak self] event in
+                self?.emit(event)
+            }
+            self.movieRecordingDelegate = delegate
+            self.movieOutput.startRecording(to: url, recordingDelegate: delegate)
+        }
+    }
+
+    func stopRecording() {
+        queue.async { [weak self] in
+            guard let self, self.movieOutput.isRecording else { return }
+            self.movieOutput.stopRecording()
+        }
+    }
+
+    func capturePhoto(to url: URL) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.session.isRunning,
+                  self.session.outputs.contains(where: { $0 === self.photoOutput })
+            else {
+                self.emit(.captureFailed(message: "拍照不可用：预览未运行或该设备不支持照片输出"))
+                return
+            }
+            let delegate = PhotoCaptureDelegate(
+                destination: url,
+                onEvent: { [weak self] event in self?.emit(event) },
+                onComplete: { [weak self] finished in
+                    self?.queue.async {
+                        self?.pendingPhotoDelegates.removeAll { $0 === finished }
+                    }
+                }
+            )
+            self.pendingPhotoDelegates.append(delegate)
+            self.photoOutput.capturePhoto(
+                with: AVCapturePhotoSettings(),
+                delegate: delegate
+            )
+        }
+    }
+
     func stop(generation: UInt64) {
         personAnalyzer.setSession(nil)
         personAnalyzer.setMotionSession(nil)
         queue.async { [weak self] in
             guard let self else { return }
+            // Ending the session mid-recording would abort the file; finish it
+            // cleanly first.
+            if self.movieOutput.isRecording {
+                self.movieOutput.stopRecording()
+            }
             if self.session.isRunning {
                 self.session.stopRunning()
             }
@@ -419,6 +561,16 @@ private final class CameraCaptureEngine: @unchecked Sendable {
                     throw CameraConfigurationError.cannotAddVideoOutput
                 }
                 session.addOutput(videoOutput)
+            }
+            // Recording and stills are best-effort extras: a device whose
+            // session refuses them still previews and tracks normally.
+            if !session.outputs.contains(where: { $0 === movieOutput }),
+               session.canAddOutput(movieOutput) {
+                session.addOutput(movieOutput)
+            }
+            if !session.outputs.contains(where: { $0 === photoOutput }),
+               session.canAddOutput(photoOutput) {
+                session.addOutput(photoOutput)
             }
             configureVideoOutputFormat()
             if let connection = videoOutput.connection(with: .video) {
@@ -656,6 +808,18 @@ final class CameraController: ObservableObject {
     @Published private(set) var selectedDeviceID: String?
     @Published private(set) var personTrackingEnabled = false
     @Published private(set) var motionCalibrationEnabled = false
+    @Published private(set) var isRecording = false
+    @Published private(set) var recordingStartedAt: Date?
+    @Published private(set) var lastCaptureURL: URL?
+    @Published private(set) var lastCaptureNotice: String?
+    @Published private(set) var autoRecordWhileTracking = UserDefaults.standard.bool(
+        forKey: "camera.autoRecordWhileTracking"
+    )
+
+    func setAutoRecordWhileTracking(_ enabled: Bool) {
+        autoRecordWhileTracking = enabled
+        UserDefaults.standard.set(enabled, forKey: "camera.autoRecordWhileTracking")
+    }
 
     /// Direct main-thread delivery for the ~12.5 Hz vision samples. Publishing
     /// these through @Published used to invalidate every camera observer's
@@ -825,6 +989,66 @@ final class CameraController: ObservableObject {
         revokeAnalysisLeases()
         status = .stopping
         requestEngineStop()
+    }
+
+    func startRecording() {
+        guard status.isRunning, !isRecording else { return }
+        guard let url = Self.captureFileURL(
+            in: .moviesDirectory,
+            fileExtension: "mov"
+        ) else {
+            lastCaptureNotice = "无法创建录像目录"
+            return
+        }
+        engine.startRecording(to: url)
+    }
+
+    func stopRecording() {
+        engine.stopRecording()
+    }
+
+    func toggleRecording() {
+        if isRecording {
+            stopRecording()
+        } else {
+            startRecording()
+        }
+    }
+
+    func capturePhoto() {
+        guard status.isRunning else { return }
+        guard let url = Self.captureFileURL(
+            in: .picturesDirectory,
+            fileExtension: "jpg"
+        ) else {
+            lastCaptureNotice = "无法创建照片目录"
+            return
+        }
+        engine.capturePhoto(to: url)
+    }
+
+    /// ~/Movies/OM3Lab 或 ~/Pictures/OM3Lab 下的时间戳文件。
+    private static func captureFileURL(
+        in directory: FileManager.SearchPathDirectory,
+        fileExtension: String
+    ) -> URL? {
+        guard let base = FileManager.default.urls(
+            for: directory,
+            in: .userDomainMask
+        ).first else { return nil }
+        let folder = base.appendingPathComponent("OM3Lab", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: folder,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return nil
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "OM3Lab-\(formatter.string(from: Date())).\(fileExtension)"
+        return folder.appendingPathComponent(name)
     }
 
     func setPersonTrackingEnabled(_ enabled: Bool) {
@@ -1137,6 +1361,23 @@ final class CameraController: ObservableObject {
             else { return }
             lastMotionSampleSequence = sample.sequence
             onMotionSample?(sample)
+
+        case let .recordingStarted(url):
+            isRecording = true
+            recordingStartedAt = Date()
+            lastCaptureURL = url
+            lastCaptureNotice = nil
+        case let .recordingFinished(url, errorMessage):
+            isRecording = false
+            recordingStartedAt = nil
+            lastCaptureURL = url
+            lastCaptureNotice = errorMessage.map { "录制结束：\($0)" }
+                ?? "已保存录像 \(url.lastPathComponent)"
+        case let .photoSaved(url):
+            lastCaptureURL = url
+            lastCaptureNotice = "已保存照片 \(url.lastPathComponent)"
+        case let .captureFailed(message):
+            lastCaptureNotice = message
 
         case let .stopped(generation):
             guard CameraStartEventPolicy.acceptsStoppedEvent(

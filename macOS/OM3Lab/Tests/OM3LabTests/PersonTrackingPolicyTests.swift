@@ -407,17 +407,86 @@ final class PersonTrackingPolicyTests: XCTestCase {
             health.motionAuthorizationDeadline(maximumSilence: 0.50)
         )
         XCTAssertEqual(deadline, 100.50, accuracy: 0.000_001)
+        // Boundary times derive from the policy's scan duration so the test
+        // stays valid when the step profile changes.
         let scanDuration = Double(PersonSearchPolicy.scanDurationTenths) / 10.0
         XCTAssertGreaterThan(
-            100.21 + scanDuration,
+            (deadline - scanDuration + 0.01) + scanDuration,
             deadline,
             "a scan that starts while currently safe can still finish too late"
         )
         XCTAssertLessThanOrEqual(
-            100.20 + scanDuration,
+            (deadline - scanDuration) + scanDuration,
             deadline,
             "a scan finishing exactly at the authorization deadline is allowed"
         )
+    }
+
+    func testCompositionTargetsShiftControlErrors() throws {
+        // Thirds-right framing: a person at frame center sits left of the
+        // target, so the correction must pull the aim left (negative yaw).
+        let thirdsRight = PersonTrackingComposition(
+            horizontalTarget: PersonTrackingComposition.thirdsRightTarget,
+            headAnchorTarget: 0.32,
+            leadRoomEnabled: false
+        )
+        let framed = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.5,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast,
+            composition: thirdsRight
+        )
+        XCTAssertLessThan(try XCTUnwrap(framed.correction).yawTenths, 0)
+
+        // Lead room shifts the target against the walk direction, so the same
+        // moving person gets a larger correction than without it.
+        var leadRoom = PersonTrackingComposition.default
+        leadRoom.leadRoomEnabled = true
+        let withoutLead = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.5,
+            anchorY: 0.32,
+            velocityX: 0.5,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast,
+            composition: .default
+        )
+        let withLead = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.5,
+            anchorY: 0.32,
+            velocityX: 0.5,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast,
+            composition: leadRoom
+        )
+        XCTAssertGreaterThan(
+            try XCTUnwrap(withLead.correction).yawTenths,
+            try XCTUnwrap(withoutLead.correction).yawTenths,
+            "lead room must open extra space ahead of a moving person"
+        )
+
+        // A higher head-anchor target (less head-room) turns the same anchor
+        // into an upward error → negative pitch.
+        var lowHeadRoom = PersonTrackingComposition.default
+        lowHeadRoom.headAnchorTarget = 0.40
+        let vertical = PersonTrackingPolicy.predictiveCorrection(
+            anchorX: 0.5,
+            anchorY: 0.32,
+            velocityX: 0,
+            velocityY: 0,
+            centering: .uncentered,
+            previousCorrection: nil,
+            speedMode: .fast,
+            composition: lowHeadRoom
+        )
+        XCTAssertLessThan(try XCTUnwrap(vertical.correction).pitchTenths, 0)
     }
 
     func testMajorReversalRequestsStop() {

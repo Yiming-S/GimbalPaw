@@ -118,12 +118,16 @@ struct PersonTrackingVisionHealth: Equatable, Sendable {
         maximumSampleAge: TimeInterval
     ) -> Bool {
         lastPipelineActivityAtUptime = receivedAtUptime
-        guard receivedAtUptime - sampleObservedAtUptime <= maximumSampleAge else {
+        let age = receivedAtUptime - sampleObservedAtUptime
+        guard age <= maximumSampleAge else {
             return false
         }
-        // Use receipt time after validating capture age. This keeps synthetic or
-        // slightly future timestamps from extending the scan authorization.
-        lastMotionSafeSampleAtUptime = receivedAtUptime
+        // A capture timestamp later than its own receipt means clock skew or a
+        // synthetic sample. Such a frame may still steer against the per-sample
+        // freshness gate, but it must never authorize an automatic scan.
+        if age >= 0 {
+            lastMotionSafeSampleAtUptime = receivedAtUptime
+        }
         return true
     }
 
@@ -1039,6 +1043,47 @@ enum PersonTrackingTravelBudgetPolicy {
     }
 }
 
+/// User-selectable framing for the tracked person. All values are normalized
+/// frame fractions; the control policy derives its per-axis errors from these
+/// targets, and the preview guide overlay draws the same values.
+struct PersonTrackingComposition: Equatable, Sendable {
+    /// Where the person's horizontal center should sit. Presets use the
+    /// rule-of-thirds lines and the frame center.
+    var horizontalTarget: Double
+    /// Where the head anchor should sit vertically (smaller = more head-room).
+    var headAnchorTarget: Double
+    /// Shifts the horizontal target against the direction of motion so a
+    /// moving person keeps space to walk into.
+    var leadRoomEnabled: Bool
+
+    static let `default` = PersonTrackingComposition(
+        horizontalTarget: 0.5,
+        headAnchorTarget: 0.32,
+        leadRoomEnabled: false
+    )
+
+    static let thirdsLeftTarget = 1.0 / 3.0
+    static let thirdsRightTarget = 2.0 / 3.0
+    static let headAnchorTargetRange = 0.24...0.40
+    /// At full lead the horizontal target shifts by this fraction.
+    static let maximumLeadRoomShift = 0.08
+    /// Velocity (frame fractions per second) at which lead room saturates.
+    static let leadRoomSaturationVelocity = 0.5
+
+    /// The lead shift scales with the filtered velocity and is clamped so the
+    /// combined target can never leave the central usable band.
+    func effectiveHorizontalTarget(velocityX: Double) -> Double {
+        guard leadRoomEnabled else { return horizontalTarget }
+        let normalized = max(
+            -1,
+            min(1, velocityX / Self.leadRoomSaturationVelocity)
+        )
+        // Moving right → target shifts left, opening space ahead of the walk.
+        let led = horizontalTarget - normalized * Self.maximumLeadRoomShift
+        return min(0.8, max(0.2, led))
+    }
+}
+
 enum PersonTrackingPolicy {
     static let horizontalDeadZone = 0.12
     // The upper-body head anchor is already filtered independently. The old
@@ -1200,14 +1245,16 @@ enum PersonTrackingPolicy {
         velocityY: Double,
         centering: PersonTrackingCenteringState,
         previousCorrection: PersonTrackingCorrection?,
-        speedMode: PersonTrackingSpeedMode
+        speedMode: PersonTrackingSpeedMode,
+        composition: PersonTrackingComposition = .default
     ) -> PersonTrackingControlDecision {
-        let horizontalError = predictedCoordinate(anchorX, velocity: velocityX) - 0.5
+        let horizontalError = predictedCoordinate(anchorX, velocity: velocityX)
+            - composition.effectiveHorizontalTarget(velocityX: velocityX)
         // Coordinates use a top-left origin: a negative error means the person
         // is above the target. The calibrated OM3 mapping uses negative pitch
         // for up.
         let verticalError = predictedCoordinate(anchorY, velocity: velocityY)
-            - verticalHeadAnchorTarget
+            - composition.headAnchorTarget
 
         let yawStep = axisStep(
             error: horizontalError,

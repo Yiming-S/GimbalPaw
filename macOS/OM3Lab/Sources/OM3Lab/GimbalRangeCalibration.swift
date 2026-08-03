@@ -241,6 +241,8 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
     @Published private(set) var currentVerifiedExtentDegrees = 0
     @Published private(set) var result: GimbalRangeCalibrationResult?
     @Published private(set) var envelopeIsActive = false
+    /// Directions already verified in the running session, for live progress UI.
+    @Published private(set) var completedMeasurements: [GimbalRangeMeasurement] = []
 
     private enum PendingVerdict {
         case moved
@@ -536,6 +538,7 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         preCommandRetryCount = 0
         preCommandRetryStartedAt = nil
         measurements.removeAll()
+        completedMeasurements = []
         result = nil
         envelopeIsActive = false
         currentDirection = nil
@@ -1812,6 +1815,9 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
             usableExtentDegrees: usable,
             kind: kind
         )
+        completedMeasurements = GimbalCalibrationDirection.allCases.compactMap {
+            measurements[$0]
+        }
         awaitingStepDecision = false
         canContinueOutward = false
         canRetryCurrentStep = false
@@ -2176,6 +2182,7 @@ final class GimbalRangeCalibrationCoordinator: ObservableObject {
         acceptedShiftMagnitudes.removeAll(keepingCapacity: true)
         directionNeedsRedo = false
         measurements.removeAll()
+        completedMeasurements = []
         result = nil
         isRunning = false
         awaitingStepDecision = false

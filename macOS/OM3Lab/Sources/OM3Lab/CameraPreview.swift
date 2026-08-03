@@ -3,6 +3,17 @@ import AVFoundation
 import QuartzCore
 import SwiftUI
 
+/// Guide data for the preview overlay, in metadata (top-left, normalized)
+/// coordinates. The preview layer converts them, so letterboxing and aspect
+/// fit stay correct on every camera.
+struct TrackingGuideOverlay: Equatable {
+    let outerDeadZoneRect: CGRect
+    let innerDeadZoneRect: CGRect
+    let target: CGPoint
+    let correction: PersonTrackingCorrection?
+    let correctionMaximumTenths: Int
+}
+
 final class CameraPreviewNSView: NSView {
     let previewLayer: AVCaptureVideoPreviewLayer
     var onSelectCandidate: ((PersonCandidateID) -> Void)?
@@ -11,12 +22,18 @@ final class CameraPreviewNSView: NSView {
     private let selectedPersonBoxLayer = CAShapeLayer()
     private let personCenterLayer = CAShapeLayer()
     private let frameCenterLayer = CAShapeLayer()
+    private let guideOuterLayer = CAShapeLayer()
+    private let guideInnerLayer = CAShapeLayer()
+    private let correctionArrowLayer = CAShapeLayer()
+    private let hoverBoxLayer = CAShapeLayer()
     private var personCandidates: [PersonCandidate] = []
     private var selectedPersonID: PersonCandidateID?
     private var candidateLabelLayers: [PersonCandidateID: CATextLayer] = [:]
     private var candidateLabelStates: [PersonCandidateID: LabelState] = [:]
     private var candidateHitTargets: [(id: PersonCandidateID, rect: CGRect)] = []
     private var trackingEnabled = false
+    private var guides: TrackingGuideOverlay?
+    private var hoveredCandidateID: PersonCandidateID?
 
     private struct LabelState: Equatable {
         let text: String
@@ -55,6 +72,44 @@ final class CameraPreviewNSView: NSView {
         frameCenterLayer.lineWidth = 1
         frameCenterLayer.lineDashPattern = [4, 4]
         previewLayer.addSublayer(frameCenterLayer)
+
+        guideOuterLayer.fillColor = NSColor.clear.cgColor
+        guideOuterLayer.strokeColor = NSColor.white.withAlphaComponent(0.28).cgColor
+        guideOuterLayer.lineWidth = 1
+        guideOuterLayer.lineDashPattern = [5, 5]
+        previewLayer.addSublayer(guideOuterLayer)
+
+        guideInnerLayer.fillColor = NSColor.clear.cgColor
+        guideInnerLayer.strokeColor = NSColor.systemYellow.withAlphaComponent(0.35).cgColor
+        guideInnerLayer.lineWidth = 1
+        guideInnerLayer.lineDashPattern = [3, 4]
+        previewLayer.addSublayer(guideInnerLayer)
+
+        correctionArrowLayer.fillColor = NSColor.clear.cgColor
+        correctionArrowLayer.strokeColor = NSColor.systemOrange.withAlphaComponent(0.9).cgColor
+        correctionArrowLayer.lineWidth = 2.5
+        correctionArrowLayer.lineCap = .round
+        previewLayer.addSublayer(correctionArrowLayer)
+
+        hoverBoxLayer.fillColor = NSColor.clear.cgColor
+        hoverBoxLayer.strokeColor = NSColor.white.withAlphaComponent(0.9).cgColor
+        hoverBoxLayer.lineWidth = 2.5
+        previewLayer.addSublayer(hoverBoxLayer)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(
+            NSTrackingArea(
+                rect: bounds,
+                options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
+                owner: self,
+                userInfo: nil
+            )
+        )
     }
 
     @available(*, unavailable)
@@ -74,7 +129,8 @@ final class CameraPreviewNSView: NSView {
     func updateTracking(
         enabled: Bool,
         candidates: [PersonCandidate],
-        selectedPersonID: PersonCandidateID?
+        selectedPersonID: PersonCandidateID?,
+        guides: TrackingGuideOverlay?
     ) {
         // SwiftUI calls updateNSView for unrelated parent re-renders too;
         // rebuilding every path and re-rasterizing every label costs real CPU
@@ -82,10 +138,12 @@ final class CameraPreviewNSView: NSView {
         guard enabled != trackingEnabled
             || candidates != personCandidates
             || selectedPersonID != self.selectedPersonID
+            || guides != self.guides
         else { return }
         trackingEnabled = enabled
         personCandidates = candidates
         self.selectedPersonID = selectedPersonID
+        self.guides = guides
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         updateTrackingLayers()
@@ -94,18 +152,68 @@ final class CameraPreviewNSView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        // Prefer the smallest box under the cursor, so a person standing in
-        // front of another remains individually selectable.
-        let hit = candidateHitTargets
-            .filter { $0.rect.insetBy(dx: -6, dy: -6).contains(point) }
-            .min { lhs, rhs in
-                lhs.rect.width * lhs.rect.height < rhs.rect.width * rhs.rect.height
-            }
-        guard let hit else {
+        guard let hit = candidateHit(at: point) else {
             super.mouseDown(with: event)
             return
         }
         onSelectCandidate?(hit.id)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let hoveredID = candidateHit(at: point)?.id
+        if hoveredID != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+        guard hoveredID != hoveredCandidateID else { return }
+        hoveredCandidateID = hoveredID
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        updateHoverLayer()
+        CATransaction.commit()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+        guard hoveredCandidateID != nil else { return }
+        hoveredCandidateID = nil
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        updateHoverLayer()
+        CATransaction.commit()
+    }
+
+    /// Prefers the smallest box under the cursor, so a person standing in
+    /// front of another remains individually selectable.
+    private func candidateHit(
+        at point: CGPoint
+    ) -> (id: PersonCandidateID, rect: CGRect)? {
+        candidateHitTargets
+            .filter { $0.rect.insetBy(dx: -6, dy: -6).contains(point) }
+            .min { lhs, rhs in
+                lhs.rect.width * lhs.rect.height < rhs.rect.width * rhs.rect.height
+            }
+    }
+
+    private func updateHoverLayer() {
+        hoverBoxLayer.frame = previewLayer.bounds
+        guard trackingEnabled,
+              let hoveredCandidateID,
+              let target = candidateHitTargets.first(
+                where: { $0.id == hoveredCandidateID }
+              )
+        else {
+            hoverBoxLayer.path = nil
+            return
+        }
+        hoverBoxLayer.path = CGPath(
+            roundedRect: target.rect.insetBy(dx: -2, dy: -2),
+            cornerWidth: 8,
+            cornerHeight: 8,
+            transform: nil
+        )
     }
 
     private func updateTrackingLayers() {
@@ -113,27 +221,41 @@ final class CameraPreviewNSView: NSView {
         selectedPersonBoxLayer.frame = previewLayer.bounds
         personCenterLayer.frame = previewLayer.bounds
         frameCenterLayer.frame = previewLayer.bounds
+        guideOuterLayer.frame = previewLayer.bounds
+        guideInnerLayer.frame = previewLayer.bounds
+        correctionArrowLayer.frame = previewLayer.bounds
 
         guard trackingEnabled else {
             candidateBoxLayer.path = nil
             selectedPersonBoxLayer.path = nil
             personCenterLayer.path = nil
             frameCenterLayer.path = nil
+            guideOuterLayer.path = nil
+            guideInnerLayer.path = nil
+            correctionArrowLayer.path = nil
             candidateHitTargets.removeAll(keepingCapacity: true)
+            hoveredCandidateID = nil
+            updateHoverLayer()
             removeAllCandidateLabels()
             return
         }
 
+        let targetPoint = guides?.target
+            ?? CGPoint(
+                x: 0.5,
+                y: PersonTrackingPolicy.verticalHeadAnchorTarget
+            )
         let guide = CGMutablePath()
         let target = layerPoint(
-            metadataX: 0.5,
-            metadataY: PersonTrackingPolicy.verticalHeadAnchorTarget
+            metadataX: targetPoint.x,
+            metadataY: targetPoint.y
         )
         guide.move(to: CGPoint(x: target.x - 13, y: target.y))
         guide.addLine(to: CGPoint(x: target.x + 13, y: target.y))
         guide.move(to: CGPoint(x: target.x, y: target.y - 13))
         guide.addLine(to: CGPoint(x: target.x, y: target.y + 13))
         frameCenterLayer.path = guide
+        updateGuideLayers(around: target)
 
         let candidatePath = CGMutablePath()
         let selectedPath = CGMutablePath()
@@ -198,6 +320,64 @@ final class CameraPreviewNSView: NSView {
         candidateBoxLayer.path = candidatePath
         selectedPersonBoxLayer.path = selectedPath
         personCenterLayer.path = centerPath
+        updateHoverLayer()
+    }
+
+    /// Draws the hysteresis dead-zone rectangles and the in-flight correction
+    /// arrow. All source rects are normalized metadata coordinates so the
+    /// drawing survives aspect-fit letterboxing on any camera.
+    private func updateGuideLayers(around targetLayerPoint: CGPoint) {
+        guard let guides else {
+            guideOuterLayer.path = nil
+            guideInnerLayer.path = nil
+            correctionArrowLayer.path = nil
+            return
+        }
+        guideOuterLayer.path = CGPath(
+            rect: previewLayer.layerRectConverted(
+                fromMetadataOutputRect: guides.outerDeadZoneRect
+            ),
+            transform: nil
+        )
+        guideInnerLayer.path = CGPath(
+            rect: previewLayer.layerRectConverted(
+                fromMetadataOutputRect: guides.innerDeadZoneRect
+            ),
+            transform: nil
+        )
+
+        guard let correction = guides.correction,
+              !correction.isZero,
+              guides.correctionMaximumTenths > 0
+        else {
+            correctionArrowLayer.path = nil
+            return
+        }
+        // The arrow points from the framing target toward where the command is
+        // steering the aim: right for positive yaw, down for positive pitch.
+        let scale = 0.15 / Double(guides.correctionMaximumTenths)
+        let tip = layerPoint(
+            metadataX: guides.target.x + Double(correction.yawTenths) * scale,
+            metadataY: guides.target.y + Double(correction.pitchTenths) * scale
+        )
+        let arrow = CGMutablePath()
+        arrow.move(to: targetLayerPoint)
+        arrow.addLine(to: tip)
+        let angle = atan2(
+            tip.y - targetLayerPoint.y,
+            tip.x - targetLayerPoint.x
+        )
+        let headLength: CGFloat = 8
+        for offset in [CGFloat.pi * 0.82, -CGFloat.pi * 0.82] {
+            arrow.move(to: tip)
+            arrow.addLine(
+                to: CGPoint(
+                    x: tip.x + cos(angle + offset) * headLength,
+                    y: tip.y + sin(angle + offset) * headLength
+                )
+            )
+        }
+        correctionArrowLayer.path = arrow
     }
 
     /// AVCaptureVideoPreviewLayer owns aspect-fit and letterbox conversion.
@@ -297,6 +477,7 @@ struct CameraPreview: NSViewRepresentable {
     let personCandidates: [PersonCandidate]
     let selectedPersonID: PersonCandidateID?
     let trackingEnabled: Bool
+    var guides: TrackingGuideOverlay?
     var onSelectCandidate: ((PersonCandidateID) -> Void)?
 
     func makeNSView(context: Context) -> CameraPreviewNSView {
@@ -305,7 +486,8 @@ struct CameraPreview: NSViewRepresentable {
         view.updateTracking(
             enabled: trackingEnabled,
             candidates: personCandidates,
-            selectedPersonID: selectedPersonID
+            selectedPersonID: selectedPersonID,
+            guides: guides
         )
         return view
     }
@@ -318,7 +500,8 @@ struct CameraPreview: NSViewRepresentable {
         nsView.updateTracking(
             enabled: trackingEnabled,
             candidates: personCandidates,
-            selectedPersonID: selectedPersonID
+            selectedPersonID: selectedPersonID,
+            guides: guides
         )
     }
 

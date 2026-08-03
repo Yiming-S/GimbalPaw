@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import SwiftUI
 
 struct ContentView: View {
@@ -12,6 +13,36 @@ struct ContentView: View {
     let calibration: GimbalRangeCalibrationCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @State private var autoStopNotice: String?
+    @AppStorage("ui.presentationMode") private var presentationMode = false
+
+    /// Zero-size enabled buttons so the shortcuts work anywhere in the window:
+    /// F toggles presentation mode, T toggles tracking, 1–9 select 人物 N.
+    private var hiddenKeyboardShortcuts: some View {
+        Group {
+            Button("") { presentationMode.toggle() }
+                .keyboardShortcut("f", modifiers: [])
+            Button("") { tracking.setEnabled(!tracking.enabled) }
+                .keyboardShortcut("t", modifiers: [])
+            ForEach(1..<10) { number in
+                Button("") { selectPerson(number: number) }
+                    .keyboardShortcut(
+                        KeyEquivalent(Character("\(number)")),
+                        modifiers: []
+                    )
+            }
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .accessibilityHidden(true)
+    }
+
+    private func selectPerson(number: Int) {
+        guard tracking.canChangePersonSelection else { return }
+        guard let match = tracking.visiblePeople.first(
+            where: { $0.id.rawValue == UInt64(number) }
+        ) else { return }
+        tracking.selectPerson(match.id)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,25 +65,50 @@ struct ContentView: View {
             }
             Divider()
 
-            HSplitView {
+            if presentationMode {
                 CameraPanel(
-                    camera: camera,
-                    tracking: tracking,
-                    calibration: calibration
-                )
-                    .frame(minWidth: 610, idealWidth: 760)
-
-                ControlPanel(
                     bluetooth: bluetooth,
                     camera: camera,
                     tracking: tracking,
                     calibration: calibration
                 )
-                    .frame(minWidth: 390, idealWidth: 440, maxWidth: 520)
+                Divider()
+                PersistentStopBar(
+                    tracking: tracking,
+                    calibration: calibration
+                )
+            } else {
+                HSplitView {
+                    CameraPanel(
+                        bluetooth: bluetooth,
+                        camera: camera,
+                        tracking: tracking,
+                        calibration: calibration
+                    )
+                        .frame(minWidth: 610, idealWidth: 760)
+
+                    ControlPanel(
+                        bluetooth: bluetooth,
+                        camera: camera,
+                        tracking: tracking,
+                        calibration: calibration
+                    )
+                        .frame(minWidth: 390, idealWidth: 440, maxWidth: 520)
+                }
             }
         }
         .frame(minWidth: 1080, minHeight: 700)
         .background(Color(nsColor: .windowBackgroundColor))
+        .background(hiddenKeyboardShortcuts)
+        .onReceive(tracking.$enabled.removeDuplicates()) { enabled in
+            // Auto-record follows the tracking session when the user opted in.
+            guard camera.autoRecordWhileTracking else { return }
+            if enabled {
+                camera.startRecording()
+            } else if camera.isRecording {
+                camera.stopRecording()
+            }
+        }
         // The bluetooth controller owns the armed state; the UI only mirrors it.
         // A rejected arm request therefore never leaves a latched-on switch.
         .onChange(of: bluetooth.motionSafetyArmed) { _, armed in
@@ -124,6 +180,21 @@ struct ContentView: View {
 
             Spacer()
 
+            Button {
+                presentationMode.toggle()
+            } label: {
+                Label(
+                    presentationMode ? "返回控制" : "拍摄模式",
+                    systemImage: presentationMode
+                        ? "rectangle.righthalf.inset.filled"
+                        : "rectangle.expand.vertical"
+                )
+            }
+            .controlSize(.small)
+            .help(presentationMode
+                ? "返回完整控制界面（F 键）"
+                : "隐藏工程控制列，只留画面与 STOP（F 键）")
+
             StatusBadge(
                 text: bluetooth.state.title,
                 color: bluetooth.state.statusColor,
@@ -136,6 +207,7 @@ struct ContentView: View {
 }
 
 private struct CameraPanel: View {
+    let bluetooth: OM3BluetoothController
     @ObservedObject var camera: CameraController
     let tracking: PersonTrackingCoordinator
     let calibration: GimbalRangeCalibrationCoordinator
@@ -184,6 +256,12 @@ private struct CameraPanel: View {
             }
             .frame(minHeight: 390)
 
+            CameraStatusStrip(
+                bluetooth: bluetooth,
+                camera: camera,
+                tracking: tracking
+            )
+
             CameraControlsRow(
                 camera: camera,
                 tracking: tracking,
@@ -202,6 +280,130 @@ private struct CameraPanel: View {
         default:
             return "画面来自所选 iPhone Camera 或外置摄像头；OM3 本身不向 Mac 传输画面。"
         }
+    }
+}
+
+/// One always-visible line under the preview: the three load-bearing states
+/// (BLE / safety / tracking), the active speed profile, the guide-overlay
+/// toggle, and the capture controls. No scrolling required to know the
+/// system's whole condition.
+private struct CameraStatusStrip: View {
+    @ObservedObject var bluetooth: OM3BluetoothController
+    @ObservedObject var camera: CameraController
+    @ObservedObject var tracking: PersonTrackingCoordinator
+    @AppStorage("ui.showTrackingGuides") private var showTrackingGuides = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                StatusBadge(
+                    text: bluetooth.state.isReady ? "OM3 已连接" : "OM3 未连接",
+                    color: bluetooth.state.isReady ? .green : .orange,
+                    symbol: "antenna.radiowaves.left.and.right"
+                )
+                .help(bluetooth.state.title)
+
+                StatusBadge(
+                    text: bluetooth.motionSafetyArmed ? "安全已解锁" : "运动锁定",
+                    color: bluetooth.motionSafetyArmed ? .green : .secondary,
+                    symbol: bluetooth.motionSafetyArmed
+                        ? "checkmark.shield.fill"
+                        : "shield.slash"
+                )
+
+                StatusBadge(
+                    text: tracking.enabled ? tracking.state.title : "跟踪关闭",
+                    color: tracking.enabled ? tracking.state.statusColor : .secondary,
+                    symbol: "person.fill.viewfinder"
+                )
+                .help(tracking.state.title)
+
+                Text(tracking.speedMode.title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.cyan)
+
+                Spacer(minLength: 8)
+
+                Toggle(isOn: $showTrackingGuides) {
+                    Image(systemName: "squareshape.split.2x2.dotted")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help("显示/隐藏跟踪引导层：死区、构图目标与修正矢量")
+
+                if camera.isRecording, let startedAt = camera.recordingStartedAt {
+                    TimelineView(.periodic(from: startedAt, by: 1)) { context in
+                        Label(
+                            elapsedText(
+                                from: startedAt,
+                                to: context.date
+                            ),
+                            systemImage: "record.circle.fill"
+                        )
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.red)
+                    }
+                }
+
+                Button {
+                    camera.capturePhoto()
+                } label: {
+                    Image(systemName: "camera")
+                }
+                .controlSize(.small)
+                .disabled(!camera.status.isRunning)
+                .help("拍摄照片（保存到 ~/Pictures/OM3Lab）")
+
+                Button {
+                    camera.toggleRecording()
+                } label: {
+                    Label(
+                        camera.isRecording ? "停止" : "录制",
+                        systemImage: camera.isRecording
+                            ? "stop.circle.fill"
+                            : "record.circle"
+                    )
+                }
+                .controlSize(.small)
+                .tint(camera.isRecording ? .red : nil)
+                .buttonStyle(.borderedProminent)
+                .disabled(!camera.status.isRunning && !camera.isRecording)
+                .help("录制预览视频（无声，保存到 ~/Movies/OM3Lab）")
+
+                Toggle(
+                    "跟踪时自动录制",
+                    isOn: Binding(
+                        get: { camera.autoRecordWhileTracking },
+                        set: { camera.setAutoRecordWhileTracking($0) }
+                    )
+                )
+                .toggleStyle(.checkbox)
+                .font(.caption2)
+            }
+
+            if let notice = camera.lastCaptureNotice {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle")
+                        .foregroundStyle(.green)
+                    Text(notice)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if let url = camera.lastCaptureURL {
+                        Button("在访达中显示") {
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption2)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+
+    private func elapsedText(from start: Date, to now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -231,6 +433,7 @@ private struct TrackingStateBadge: View {
 private struct TrackingCameraPreview: View {
     let session: AVCaptureSession
     @ObservedObject var tracking: PersonTrackingCoordinator
+    @AppStorage("ui.showTrackingGuides") private var showTrackingGuides = true
 
     var body: some View {
         CameraPreview(
@@ -238,6 +441,7 @@ private struct TrackingCameraPreview: View {
             personCandidates: tracking.visiblePeople,
             selectedPersonID: tracking.selectedPersonID,
             trackingEnabled: tracking.enabled,
+            guides: guideOverlay,
             onSelectCandidate: { candidateID in
                 guard tracking.canChangePersonSelection else { return }
                 tracking.selectPerson(candidateID)
@@ -248,6 +452,37 @@ private struct TrackingCameraPreview: View {
         .overlay(alignment: .top) {
             TrackingPauseBanner(tracking: tracking)
         }
+    }
+
+    /// Dead-zone rectangles, framing target, and the in-flight correction —
+    /// the same values the control policy uses, so what the overlay shows is
+    /// exactly what the gimbal is doing.
+    private var guideOverlay: TrackingGuideOverlay? {
+        guard showTrackingGuides, tracking.enabled else { return nil }
+        let composition = tracking.composition
+        let target = CGPoint(
+            x: composition.horizontalTarget,
+            y: composition.headAnchorTarget
+        )
+        let outer = CGRect(
+            x: target.x - PersonTrackingPolicy.horizontalDeadZone,
+            y: target.y - PersonTrackingPolicy.verticalDeadZone,
+            width: PersonTrackingPolicy.horizontalDeadZone * 2,
+            height: PersonTrackingPolicy.verticalDeadZone * 2
+        )
+        let inner = CGRect(
+            x: target.x - PersonTrackingPolicy.horizontalInnerDeadZone,
+            y: target.y - PersonTrackingPolicy.verticalInnerDeadZone,
+            width: PersonTrackingPolicy.horizontalInnerDeadZone * 2,
+            height: PersonTrackingPolicy.verticalInnerDeadZone * 2
+        )
+        return TrackingGuideOverlay(
+            outerDeadZoneRect: outer,
+            innerDeadZoneRect: inner,
+            target: target,
+            correction: tracking.displayedCorrection,
+            correctionMaximumTenths: tracking.speedMode.combinedMaximumTenths
+        )
     }
 
     private var accessibilityLabel: String {
@@ -500,6 +735,7 @@ private struct ControlPanel: View {
                             tracking: tracking,
                             calibration: calibration
                         )
+                        TrackingTimelineSection(tracking: tracking)
                     }
                     .padding(18)
                 }
@@ -1043,14 +1279,12 @@ private struct ControlPanel: View {
                     .accessibilityLabel("全向行程验证进度")
                     .accessibilityValue("\(Int(calibration.progress * 100))%")
 
-                if let direction = calibration.currentDirection {
-                    HStack {
-                        Label(direction.title, systemImage: calibrationDirectionSymbol(direction))
-                        Spacer()
-                        Text("已确认 \(calibration.currentVerifiedExtentDegrees)°")
-                            .monospacedDigit()
+                // Per-direction live progress: completed directions show the
+                // credited extent, the active one shows its running probe.
+                VStack(spacing: 4) {
+                    ForEach(GimbalCalibrationDirection.allCases) { direction in
+                        directionProgressRow(direction)
                     }
-                    .font(.caption)
                 }
             }
 
@@ -1097,6 +1331,17 @@ private struct ControlPanel: View {
                     }
                 }
             }
+
+            EnvelopeDiagram(
+                envelope: bluetooth.calibratedTrackingEnvelope
+                    ?? calibration.result?.envelope
+                    ?? OM3HardwareMotionLimits.centeredFallbackTrackingEnvelope,
+                isMeasured: bluetooth.calibratedTrackingEnvelope != nil
+                    || calibration.result != nil,
+                poseTenths: bluetooth.personTrackingActive
+                    ? bluetooth.estimatedPoseTenths
+                    : nil
+            )
 
             if calibration.manualRecoveryPaused {
                 HStack(spacing: 8) {
@@ -1229,6 +1474,40 @@ private struct ControlPanel: View {
                 .help("记录每个 BLE 分片的 TX/RX 十六进制内容；极速跟踪时会明显增加主线程负载")
             }
 
+            HStack(spacing: 8) {
+                if bluetooth.rxCaptureActive {
+                    Button {
+                        _ = bluetooth.finishRXCaptureAndExport()
+                    } label: {
+                        Label(
+                            "停止抓包并导出（已 \(bluetooth.rxCaptureFrameCount) 帧）",
+                            systemImage: "stop.circle"
+                        )
+                    }
+                    .controlSize(.small)
+                    .tint(.orange)
+                } else {
+                    Button {
+                        bluetooth.startRXCapture()
+                    } label: {
+                        Label("FFF4 抓包 30 秒", systemImage: "waveform.badge.magnifyingglass")
+                    }
+                    .controlSize(.small)
+                    .disabled(!bluetooth.state.isReady)
+                    .help("录制原始 FFF4 通知并导出到下载目录，用于离线解析姿态遥测")
+                }
+
+                Button {
+                    exportDiagnostics()
+                } label: {
+                    Label("导出诊断", systemImage: "square.and.arrow.up")
+                }
+                .controlSize(.small)
+                .help("把当前状态、时间线、验证结果和全部日志打包成文本文件")
+
+                Spacer()
+            }
+
             ForEach(bluetooth.logs.prefix(12)) { entry in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(entry.timestamp, style: .time)
@@ -1336,6 +1615,43 @@ private struct ControlPanel: View {
         }
     }
 
+    private func directionProgressRow(
+        _ direction: GimbalCalibrationDirection
+    ) -> some View {
+        let cap = Double(direction.probeLimitDegrees)
+        let completed = calibration.completedMeasurements.first {
+            $0.direction == direction
+        }
+        let isActive = calibration.currentDirection == direction
+        let value: Double
+        let trailing: String
+        let tint: Color
+        if let completed {
+            value = Double(completed.verifiedExtentDegrees) / max(cap, 1)
+            trailing = "可用 \(completed.usableExtentDegrees)°"
+            tint = .green
+        } else if isActive {
+            value = Double(calibration.currentVerifiedExtentDegrees) / max(cap, 1)
+            trailing = "已确认 \(calibration.currentVerifiedExtentDegrees)°"
+            tint = calibration.awaitingCenterConfirmation ? .orange : .cyan
+        } else {
+            value = 0
+            trailing = "待验证"
+            tint = .gray
+        }
+        return HStack(spacing: 8) {
+            Label(direction.title, systemImage: calibrationDirectionSymbol(direction))
+                .font(.caption2)
+                .frame(width: 56, alignment: .leading)
+            ProgressView(value: min(1, value))
+                .tint(tint)
+            Text(trailing)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 76, alignment: .trailing)
+        }
+    }
+
     private var confirmedDirectionButtonTitle: String {
         guard let direction = calibration.currentDirection else {
             return "确认实际移动，继续"
@@ -1356,6 +1672,126 @@ private struct ControlPanel: View {
         }
     }
 
+    /// One-click plain-text snapshot of everything relevant to a field issue.
+    private func exportDiagnostics() {
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var lines: [String] = []
+        lines.append("# OM3 Lab 诊断导出")
+        lines.append("导出时间: \(timeFormatter.string(from: Date()))")
+        lines.append("")
+        lines.append("## 连接")
+        lines.append("BLE 状态: \(bluetooth.state.title)")
+        lines.append("记忆设备: \(bluetooth.rememberedDeviceName ?? "无")")
+        lines.append("运动安全确认: \(bluetooth.motionSafetyArmed ? "已解锁" : "锁定")")
+        lines.append("原点已确认: \(bluetooth.trackingOriginConfirmed ? "是" : "否")")
+        lines.append("")
+        lines.append("## 摄像头")
+        lines.append("状态: \(camera.status.title)")
+        lines.append("已选设备: \(camera.selectedDeviceID ?? "无")")
+        lines.append(
+            "候选设备: \(camera.devices.map { "\($0.name)(\($0.id.prefix(8)))" }.joined(separator: ", "))"
+        )
+        lines.append("正在录制: \(camera.isRecording ? "是" : "否")")
+        lines.append("")
+        lines.append("## 人物跟踪")
+        lines.append("状态: \(tracking.state.title)")
+        lines.append("速度档位: \(tracking.speedMode.title)")
+        let composition = tracking.composition
+        lines.append(
+            String(
+                format: "构图: 水平目标 %.2f · 头部高度 %.2f · 运动留白 %@",
+                composition.horizontalTarget,
+                composition.headAnchorTarget,
+                composition.leadRoomEnabled ? "开" : "关"
+            )
+        )
+        lines.append("画面候选: \(tracking.visiblePeople.count) 人")
+        lines.append("")
+        lines.append("### 跟踪时间线（新→旧）")
+        for event in tracking.recentEvents {
+            lines.append("\(timeFormatter.string(from: event.date))  \(event.title)")
+        }
+        lines.append("")
+        lines.append("## 全向验证")
+        lines.append("状态: \(calibration.statusText)")
+        if let result = calibration.result {
+            for measurement in result.measurements {
+                lines.append(
+                    "\(measurement.direction.title): 验证 \(measurement.verifiedExtentDegrees)° · 可用 \(measurement.usableExtentDegrees)° · \(measurement.note)"
+                )
+            }
+        } else {
+            lines.append("尚无完整测量结果")
+        }
+        lines.append(activeRangeText)
+        lines.append(calibrationCeilingText)
+        lines.append("")
+        lines.append("## BLE 日志（新→旧，共 \(bluetooth.logs.count) 条）")
+        for entry in bluetooth.logs {
+            lines.append(
+                "\(timeFormatter.string(from: entry.timestamp))  \(entry.message)"
+            )
+        }
+
+        let nameFormatter = DateFormatter()
+        nameFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        guard let downloads = FileManager.default.urls(
+            for: .downloadsDirectory,
+            in: .userDomainMask
+        ).first else { return }
+        let url = downloads.appendingPathComponent(
+            "OM3Lab-diagnostics-\(nameFormatter.string(from: Date())).txt"
+        )
+        do {
+            try lines.joined(separator: "\n")
+                .write(to: url, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            // The log section is visible right next to this button; surface
+            // the failure there via the bluetooth log.
+        }
+    }
+
+}
+
+/// A compact, human-readable story of the tracking session: key transitions
+/// only, newest first. Raw BLE logs stay in the advanced page.
+private struct TrackingTimelineSection: View {
+    @ObservedObject var tracking: PersonTrackingCoordinator
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label("跟踪时间线", systemImage: "clock.arrow.circlepath")
+                .font(.caption.weight(.semibold))
+
+            if tracking.recentEvents.isEmpty {
+                Text("开启人物跟踪后，关键状态变化会按时间列在这里。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(tracking.recentEvents.prefix(6)) { event in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(event.date, style: .time)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 58, alignment: .leading)
+                        Image(systemName: event.symbol)
+                            .font(.caption2)
+                            .foregroundStyle(.cyan)
+                            .frame(width: 15)
+                        Text(event.title)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+    }
 }
 
 /// A non-scrolling emergency control. Keeping the high-frequency tracking
@@ -1527,6 +1963,8 @@ private struct TrackingSection: View {
                     .controlSize(.small)
                 }
             }
+
+            compositionSection
         }
         .padding(12)
         .background(
@@ -1537,6 +1975,84 @@ private struct TrackingSection: View {
             RoundedRectangle(cornerRadius: 11)
                 .stroke(tracking.enabled ? .cyan.opacity(0.28) : .white.opacity(0.06))
         }
+    }
+
+    /// Framing preferences. Changes apply live — the target simply moves and
+    /// the next control cycle reframes toward it.
+    private var compositionSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("构图", systemImage: "rectangle.inset.topleading.filled")
+                Spacer()
+            }
+            .font(.caption.weight(.medium))
+
+            Picker(
+                "水平位置",
+                selection: Binding(
+                    get: { horizontalPresetIndex },
+                    set: { applyHorizontalPreset($0) }
+                )
+            ) {
+                Text("三分左").tag(0)
+                Text("居中").tag(1)
+                Text("三分右").tag(2)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+
+            HStack(spacing: 8) {
+                Text("头部高度")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Slider(
+                    value: Binding(
+                        get: { tracking.composition.headAnchorTarget },
+                        set: { value in
+                            var composition = tracking.composition
+                            composition.headAnchorTarget = value
+                            tracking.setComposition(composition)
+                        }
+                    ),
+                    in: PersonTrackingComposition.headAnchorTargetRange
+                )
+                Text("\(Int(tracking.composition.headAnchorTarget * 100))%")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, alignment: .trailing)
+            }
+
+            Toggle(
+                "运动方向留白（按移动方向自动让出空间）",
+                isOn: Binding(
+                    get: { tracking.composition.leadRoomEnabled },
+                    set: { enabled in
+                        var composition = tracking.composition
+                        composition.leadRoomEnabled = enabled
+                        tracking.setComposition(composition)
+                    }
+                )
+            )
+            .toggleStyle(.checkbox)
+            .font(.caption2)
+        }
+    }
+
+    private var horizontalPresetIndex: Int {
+        let target = tracking.composition.horizontalTarget
+        if target < 0.45 { return 0 }
+        if target > 0.55 { return 2 }
+        return 1
+    }
+
+    private func applyHorizontalPreset(_ index: Int) {
+        var composition = tracking.composition
+        switch index {
+        case 0: composition.horizontalTarget = PersonTrackingComposition.thirdsLeftTarget
+        case 2: composition.horizontalTarget = PersonTrackingComposition.thirdsRightTarget
+        default: composition.horizontalTarget = 0.5
+        }
+        tracking.setComposition(composition)
     }
 
     private var personSelectionSection: some View {
@@ -1816,6 +2332,109 @@ private struct MotionSection: View {
         bluetooth.sendNudge(yawDegrees: yaw, pitchDegrees: pitch, label: label)
     }
 
+}
+
+/// A to-scale diamond of the active (or fallback) tracking envelope with the
+/// command-integration pose estimate, so the operator can see at a glance how
+/// close the gimbal is to its boundary.
+private struct EnvelopeDiagram: View {
+    let envelope: GimbalTrackingEnvelope
+    let isMeasured: Bool
+    let poseTenths: PersonTrackingCorrection?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Label(
+                    isMeasured ? "实测跟踪包络" : "默认跟踪包络",
+                    systemImage: "diamond"
+                )
+                .font(.caption2.weight(.semibold))
+                Spacer()
+                if poseTenths != nil {
+                    Label("当前姿态估计", systemImage: "circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Canvas { context, size in
+                let maxYawTenths = Double(
+                    max(envelope.leftYawTenths, envelope.rightYawTenths)
+                )
+                let maxPitchTenths = Double(
+                    max(envelope.upPitchTenths, envelope.downPitchTenths)
+                )
+                guard maxYawTenths > 0, maxPitchTenths > 0 else { return }
+                let inset = 12.0
+                let center = CGPoint(x: size.width / 2, y: size.height / 2)
+                let xScale = (size.width / 2 - inset) / maxYawTenths
+                let yScale = (size.height / 2 - inset) / maxPitchTenths
+
+                func point(yaw: Double, pitch: Double) -> CGPoint {
+                    CGPoint(
+                        x: center.x + yaw * xScale,
+                        y: center.y + pitch * yScale
+                    )
+                }
+
+                var diamond = Path()
+                diamond.move(to: point(yaw: -Double(envelope.leftYawTenths), pitch: 0))
+                diamond.addLine(to: point(yaw: 0, pitch: -Double(envelope.upPitchTenths)))
+                diamond.addLine(to: point(yaw: Double(envelope.rightYawTenths), pitch: 0))
+                diamond.addLine(to: point(yaw: 0, pitch: Double(envelope.downPitchTenths)))
+                diamond.closeSubpath()
+                context.fill(diamond, with: .color(.cyan.opacity(0.10)))
+                context.stroke(
+                    diamond,
+                    with: .color(isMeasured ? .green.opacity(0.7) : .cyan.opacity(0.6)),
+                    lineWidth: 1.5
+                )
+
+                var axes = Path()
+                axes.move(to: point(yaw: -maxYawTenths, pitch: 0))
+                axes.addLine(to: point(yaw: maxYawTenths, pitch: 0))
+                axes.move(to: point(yaw: 0, pitch: -maxPitchTenths))
+                axes.addLine(to: point(yaw: 0, pitch: maxPitchTenths))
+                context.stroke(
+                    axes,
+                    with: .color(.white.opacity(0.15)),
+                    style: StrokeStyle(lineWidth: 1, dash: [3, 4])
+                )
+
+                if let poseTenths {
+                    let pose = point(
+                        yaw: Double(poseTenths.yawTenths),
+                        pitch: Double(poseTenths.pitchTenths)
+                    )
+                    context.fill(
+                        Path(ellipseIn: CGRect(
+                            x: pose.x - 4,
+                            y: pose.y - 4,
+                            width: 8,
+                            height: 8
+                        )),
+                        with: .color(.orange)
+                    )
+                }
+            }
+            .frame(height: 110)
+
+            HStack {
+                Text("左 \(degrees(envelope.leftYawTenths))° · 右 \(degrees(envelope.rightYawTenths))°")
+                Spacer()
+                Text("上 \(degrees(envelope.upPitchTenths))° · 下 \(degrees(envelope.downPitchTenths))°")
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .background(.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func degrees(_ tenths: Int) -> String {
+        String(format: "%.0f", Double(tenths) / 10.0)
+    }
 }
 
 private struct DeviceRow: View {
