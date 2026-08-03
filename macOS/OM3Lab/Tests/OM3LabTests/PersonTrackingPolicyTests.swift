@@ -547,10 +547,6 @@ final class PersonTrackingPolicyTests: XCTestCase {
             PersonTrackingCorrection(yawTenths: -65, pitchTenths: 0)
         )
         XCTAssertEqual(
-            PersonTrackingPolicy.correction(for: farLeft, speedMode: .turbo50x),
-            PersonTrackingCorrection(yawTenths: -120, pitchTenths: 0)
-        )
-        XCTAssertEqual(
             PersonTrackingPolicy.correction(
                 for: detection(centerX: 0.65, centerY: 0.5),
                 speedMode: .fast
@@ -564,29 +560,19 @@ final class PersonTrackingPolicyTests: XCTestCase {
             ),
             PersonTrackingCorrection(yawTenths: 50, pitchTenths: 0)
         )
-        XCTAssertEqual(
-            PersonTrackingPolicy.correction(
-                for: detection(centerX: 0.65, centerY: 0.5),
-                speedMode: .turbo50x
-            ),
-            PersonTrackingCorrection(yawTenths: 47, pitchTenths: 0)
-        )
-        XCTAssertEqual(
-            PersonTrackingPolicy.correction(
-                for: detection(centerX: 0.78, centerY: 0.5),
-                speedMode: .turbo50x
-            ),
-            PersonTrackingCorrection(yawTenths: 106, pitchTenths: 0)
+        XCTAssertEqual(PersonTrackingSpeedMode.allCases, [.smooth, .standard, .fast])
+        XCTAssertNil(
+            PersonTrackingSpeedMode(
+                rawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue
+            )
         )
 
         for mode in PersonTrackingSpeedMode.allCases {
             let duration = Double(mode.commandDurationTenths) / 10.0
-            if mode == .fast || mode == .turbo50x {
-                XCTAssertEqual(mode.commandCooldown, duration, accuracy: 0.000_001)
-            } else {
-                XCTAssertGreaterThanOrEqual(mode.commandCooldown, duration + 0.10)
-            }
-            XCTAssertLessThanOrEqual(mode.pitchMaximumTenths, 91)
+            XCTAssertEqual(mode.commandDurationTenths, 1)
+            XCTAssertEqual(mode.commandCooldown, duration, accuracy: 0.000_001)
+            XCTAssertEqual(mode.maximumSampleAge, duration, accuracy: 0.000_001)
+            XCTAssertLessThanOrEqual(mode.pitchMaximumTenths, 20)
             XCTAssertLessThanOrEqual(
                 mode.combinedMaximumTenths,
                 OM3HardwareMotionLimits.maximumCombinedCommandTenths(
@@ -602,51 +588,20 @@ final class PersonTrackingPolicyTests: XCTestCase {
             upgradedMaximumRate,
             previousContinuousMaximumRate * 3.0
         )
-        XCTAssertLessThanOrEqual(
-            PersonTrackingSpeedMode.fast.maximumSampleAge,
-            PersonTrackingSpeedMode.fast.commandCooldown
-        )
-        let smoothYawRate = Double(PersonTrackingSpeedMode.smooth.yawMaximumTenths)
-            / PersonTrackingSpeedMode.smooth.commandCooldown
-        let turboYawRate = Double(PersonTrackingSpeedMode.turbo50x.yawMaximumTenths)
-            / PersonTrackingSpeedMode.turbo50x.commandCooldown
-        let smoothPitchRate = Double(PersonTrackingSpeedMode.smooth.pitchMaximumTenths)
-            / PersonTrackingSpeedMode.smooth.commandCooldown
-        let turboPitchRate = Double(PersonTrackingSpeedMode.turbo50x.pitchMaximumTenths)
-            / PersonTrackingSpeedMode.turbo50x.commandCooldown
-        XCTAssertEqual(
-            turboYawRate,
-            Double(OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond),
-            accuracy: 0.000_001
-        )
-        XCTAssertGreaterThan(turboYawRate / smoothYawRate, 40.0)
-        XCTAssertLessThanOrEqual(turboYawRate / smoothYawRate, 50.0)
-        XCTAssertEqual(turboPitchRate / smoothPitchRate, 50.0, accuracy: 0.5)
-        XCTAssertEqual(
-            Double(PersonTrackingSpeedMode.turbo50x.minimumStepTenths)
-                / PersonTrackingSpeedMode.turbo50x.commandCooldown
-                / (Double(PersonTrackingSpeedMode.smooth.minimumStepTenths)
-                    / PersonTrackingSpeedMode.smooth.commandCooldown),
-            50.0,
-            accuracy: 1.5
-        )
-        XCTAssertEqual(
-            Double(PersonTrackingSpeedMode.turbo50x.mediumStepTenths)
-                / PersonTrackingSpeedMode.turbo50x.commandCooldown
-                / (Double(PersonTrackingSpeedMode.smooth.mediumStepTenths)
-                    / PersonTrackingSpeedMode.smooth.commandCooldown),
-            50.0,
-            accuracy: 0.5
-        )
-        XCTAssertEqual(PersonTrackingSpeedMode.turbo50x.commandDurationTenths, 1)
-        XCTAssertLessThanOrEqual(
-            PersonTrackingSpeedMode.turbo50x.maximumSampleAge,
-            PersonTrackingSpeedMode.turbo50x.commandCooldown
-        )
+        let yawRates = PersonTrackingSpeedMode.allCases.map {
+            Double($0.yawMaximumTenths) / $0.commandCooldown
+        }
+        let pitchRates = PersonTrackingSpeedMode.allCases.map {
+            Double($0.pitchMaximumTenths) / $0.commandCooldown
+        }
+        XCTAssertLessThan(yawRates[0], yawRates[1])
+        XCTAssertLessThan(yawRates[1], yawRates[2])
+        XCTAssertLessThan(pitchRates[0], pitchRates[1])
+        XCTAssertLessThan(pitchRates[1], pitchRates[2])
         XCTAssertGreaterThanOrEqual(PersonTrackingPolicy.minimumStopCooldown, 0.12)
     }
 
-    func testTurboProfileRemovesLegacyGrowthBottleneckButStillStopsOnReverse() throws {
+    func testContinuousFastRetainsBoundedGrowthAndStopsOnReverse() throws {
         let growth = PersonTrackingPolicy.predictiveCorrection(
             anchorX: 0.95,
             anchorY: 0.32,
@@ -654,9 +609,9 @@ final class PersonTrackingPolicyTests: XCTestCase {
             velocityY: 0,
             centering: .uncentered,
             previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
-            speedMode: .turbo50x
+            speedMode: .fast
         )
-        XCTAssertEqual(try XCTUnwrap(growth.correction).yawTenths, 120)
+        XCTAssertEqual(try XCTUnwrap(growth.correction).yawTenths, 48)
 
         let reverse = PersonTrackingPolicy.predictiveCorrection(
             anchorX: 0.05,
@@ -665,7 +620,7 @@ final class PersonTrackingPolicyTests: XCTestCase {
             velocityY: 0,
             centering: .uncentered,
             previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
-            speedMode: .turbo50x
+            speedMode: .fast
         )
         XCTAssertTrue(reverse.requiresReversalStop)
         XCTAssertNil(reverse.correction)
@@ -684,55 +639,69 @@ final class PersonTrackingPolicyTests: XCTestCase {
         }
         XCTAssertTrue(
             PersonTrackingTravelBudgetPolicy.allowsCorrection(
-                nextYawTravelTenths: 45_000,
-                nextPitchTravelTenths: 45_000,
-                speedMode: .turbo50x
+                nextYawTravelTenths: 12_000,
+                nextPitchTravelTenths: 12_000,
+                speedMode: .fast
             )
         )
         XCTAssertFalse(
             PersonTrackingTravelBudgetPolicy.allowsCorrection(
-                nextYawTravelTenths: 45_001,
-                nextPitchTravelTenths: 45_000,
-                speedMode: .turbo50x
+                nextYawTravelTenths: 12_001,
+                nextPitchTravelTenths: 12_000,
+                speedMode: .fast
             )
         )
         XCTAssertFalse(
             PersonTrackingTravelBudgetPolicy.allowsSearch(
-                nextYawTravelTenths: 45_001,
+                nextYawTravelTenths: 12_001,
                 nextPitchTravelTenths: 0,
-                speedMode: .turbo50x
+                speedMode: .fast
             )
         )
         XCTAssertFalse(
             PersonTrackingTravelBudgetPolicy.allowsSearch(
                 nextYawTravelTenths: 0,
-                nextPitchTravelTenths: 45_001,
-                speedMode: .turbo50x
+                nextPitchTravelTenths: 12_001,
+                speedMode: .fast
             )
         )
     }
 
-    func testSpeedProfileMigrationRunsOnceThenPreservesManualChoice() {
+    func testRetiredSpeedMigratesToFastAndValidChoicesPersist() {
         XCTAssertEqual(
             PersonTrackingSpeedSelectionPolicy.selection(
-                storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
-                storedProfileVersion: nil
+                storedRawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue,
+                storedProfileVersion: 1
             ),
-            PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true)
+            PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true)
+        )
+        XCTAssertEqual(
+            PersonTrackingSpeedSelectionPolicy.selection(
+                storedRawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue,
+                storedProfileVersion: PersonTrackingSpeedSelectionPolicy.currentProfileVersion
+            ),
+            PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true)
         )
         XCTAssertEqual(
             PersonTrackingSpeedSelectionPolicy.selection(
                 storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
                 storedProfileVersion: 1
             ),
-            PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: false)
+            PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: true)
+        )
+        XCTAssertEqual(
+            PersonTrackingSpeedSelectionPolicy.selection(
+                storedRawValue: PersonTrackingSpeedMode.standard.rawValue,
+                storedProfileVersion: PersonTrackingSpeedSelectionPolicy.currentProfileVersion
+            ),
+            PersonTrackingSpeedSelection(mode: .standard, requiresWriteback: false)
         )
         XCTAssertEqual(
             PersonTrackingSpeedSelectionPolicy.selection(
                 storedRawValue: nil,
-                storedProfileVersion: 1
+                storedProfileVersion: nil
             ),
-            PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true)
+            PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true)
         )
     }
 

@@ -189,8 +189,6 @@ private struct CameraPanel: View {
                 tracking: tracking,
                 calibration: calibration
             )
-
-            WiringStrip()
         }
         .padding(18)
     }
@@ -398,7 +396,7 @@ private struct CameraControlsRow: View {
             .accessibilityLabel("刷新摄像头列表")
             .disabled(previewActionsLocked)
 
-            Button("停止") {
+            Button("停止预览") {
                 camera.stop()
             }
             .disabled(!camera.status.isRunning || previewActionsLocked)
@@ -431,6 +429,42 @@ private struct CameraControlsRow: View {
     }
 }
 
+private enum AdvancedHelpPage: String, CaseIterable, Identifiable {
+    case guide
+    case manualControl
+    case calibration
+    case diagnostics
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .guide: return "使用说明"
+        case .manualControl: return "手动控制"
+        case .calibration: return "全向安全"
+        case .diagnostics: return "诊断日志"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .guide: return "book.closed"
+        case .manualControl: return "dpad"
+        case .calibration: return "scope"
+        case .diagnostics: return "terminal"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .guide: return "连接、跟踪与紧急停止"
+        case .manualControl: return "固定角度点动调试"
+        case .calibration: return "按当前安装验证四向安全范围"
+        case .diagnostics: return "BLE 状态与逐包记录"
+        }
+    }
+}
+
 private struct ControlPanel: View {
     @ObservedObject var bluetooth: OM3BluetoothController
     @ObservedObject var camera: CameraController
@@ -438,30 +472,44 @@ private struct ControlPanel: View {
     @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
     @State private var showCandidateDevices = true
     @State private var showCalibrationStartConfirmation = false
+    @State private var showAdvancedHelp = false
+    @State private var advancedHelpPage: AdvancedHelpPage = .guide
 
     private var safetyArmed: Bool { bluetooth.motionSafetyArmed }
+    private var safetyReady: Bool {
+        safetyArmed && bluetooth.trackingOriginConfirmed
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                connectionSection
-                Divider()
-                safetySection
-                calibrationSection
-                TrackingSection(
-                    bluetooth: bluetooth,
-                    tracking: tracking,
-                    calibration: calibration
-                )
-                MotionSection(
-                    bluetooth: bluetooth,
-                    tracking: tracking,
-                    calibration: calibration
-                )
-                Divider()
-                logSection
+        VStack(spacing: 0) {
+            if showAdvancedHelp {
+                advancedControlPanel
+            } else {
+                if calibration.isRunning {
+                    calibrationActivityBanner
+                    Divider()
+                }
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        controlPanelHeader
+                        connectionSection
+                        safetySection
+                        TrackingSection(
+                            bluetooth: bluetooth,
+                            tracking: tracking,
+                            calibration: calibration
+                        )
+                    }
+                    .padding(18)
+                }
             }
-            .padding(18)
+
+            Divider()
+            PersistentStopBar(
+                tracking: tracking,
+                calibration: calibration
+            )
         }
         .onChange(of: bluetooth.state) { _, newState in
             if newState.isReady {
@@ -482,6 +530,282 @@ private struct ControlPanel: View {
         } message: {
             Text("请先把 OM3 人工置于居中起点，确认负载配平、摄像头刚性固定、软线在左右上下全程都有余量，周围无人和障碍物，并把手放在电源开关附近。DJI 手册中的 Pan -162.5°～170.3°、Tilt -104.5°～235.7°是结构范围，不是本次安装可直接使用的对称控制范围；App 会分别验证左、右、上、下并保留端点余量。运行中可随时按 STOP。")
         }
+    }
+
+    private var controlPanelHeader: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("控制中心")
+                    .font(.title3.weight(.semibold))
+                Text("连接 → 安全确认 → 选择速度 → 开始跟踪")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                openAdvancedHelp(.guide)
+            } label: {
+                Label("高级与帮助", systemImage: "slider.horizontal.3")
+            }
+            .controlSize(.small)
+            .help("打开使用说明、全向安全验证和诊断日志")
+            .accessibilityIdentifier("advancedHelpButton")
+        }
+    }
+
+    private var advancedControlPanel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button {
+                    showAdvancedHelp = false
+                } label: {
+                    Label("返回", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.cyan)
+                .accessibilityLabel("返回控制中心")
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("高级控制与帮助")
+                        .font(.headline)
+                    Text(advancedHelpPage.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if calibration.isRunning {
+                    Button {
+                        advancedHelpPage = .calibration
+                    } label: {
+                        Label(
+                            calibrationNeedsAttention
+                                ? "需处理 \(Int(calibration.progress * 100))%"
+                                : "验证 \(Int(calibration.progress * 100))%",
+                            systemImage: "scope"
+                        )
+                        .monospacedDigit()
+                    }
+                    .controlSize(.small)
+                    .tint(calibrationNeedsAttention ? .orange : .cyan)
+                    .help("返回正在进行的全向安全验证")
+                    .accessibilityIdentifier("activeCalibrationShortcut")
+                    .accessibilityValue(
+                        calibrationNeedsAttention ? "等待人工处理" : "自动进行中"
+                    )
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 10)
+
+            Picker("高级与帮助页面", selection: $advancedHelpPage) {
+                ForEach(AdvancedHelpPage.allCases) { page in
+                    Text(page.title).tag(page)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+            .accessibilityIdentifier("advancedPagePicker")
+
+            Divider()
+            advancedHelpDetail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private var advancedHelpDetail: some View {
+        switch advancedHelpPage {
+        case .guide:
+            ScrollView {
+                usageGuideSection
+                    .padding(22)
+            }
+        case .manualControl:
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    advancedPageHeader(
+                        title: "手动控制",
+                        subtitle: "固定点动只用于安装与方向调试；人物跟踪时不需要操作。",
+                        symbol: "dpad"
+                    )
+                    MotionSection(
+                        bluetooth: bluetooth,
+                        tracking: tracking,
+                        calibration: calibration
+                    )
+                    .padding(14)
+                    .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 11))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 11)
+                            .stroke(.white.opacity(0.06))
+                    }
+                }
+                .padding(22)
+            }
+        case .calibration:
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    advancedPageHeader(
+                        title: "全向安全",
+                        subtitle: "建立当前载荷、姿态和线缆条件下的四向跟踪硬边界。它不是每次启动都要执行的日常步骤。",
+                        symbol: "scope"
+                    )
+                    calibrationSection
+                }
+                .padding(22)
+            }
+        case .diagnostics:
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    advancedPageHeader(
+                        title: "诊断日志",
+                        subtitle: "仅在排查连接或跟踪问题时使用；逐包日志默认保持关闭。",
+                        symbol: "terminal"
+                    )
+                    TrackingDiagnosticsSection(tracking: tracking)
+                    Divider()
+                    logSection
+                }
+                .padding(22)
+            }
+        }
+    }
+
+    private var usageGuideSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            advancedPageHeader(
+                title: "使用说明",
+                subtitle: "主界面只保留日常使用所需的连接、安全确认、人物选择和跟踪控制。",
+                symbol: "book.closed"
+            )
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    guideStep(1, "选择摄像头", "在预览下方选择 iPhone Camera 或任意可用外置摄像头，并启动预览。")
+                    guideStep(2, "连接 OM3", "OM3 开机后会优先自动连接记忆设备；需要更换时再展开候选列表。")
+                    guideStep(3, "确认运动安全", "人工回中、检查配平和软线余量，再打开主界面的运动安全确认。")
+                    guideStep(4, "选择并跟踪人物", "首次识别默认锁定人物 1；也可点击预览框或人物编号切换目标。")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("日常流程", systemImage: "checklist")
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Mac mini ── BLE 无线 ── OM3")
+                    Text("Mac mini ── 摄像头连接 ── iPhone Camera / USB 摄像头")
+                    Text("OM3 ── USB 线 ── 充电器（可选，仅供电）")
+                }
+                .font(.callout.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("连接关系", systemImage: "cable.connector")
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 9) {
+                    Label("OM3 不向 Mac 传输画面；画面始终来自当前选择的摄像头。", systemImage: "video")
+                    Label("摄像头线必须柔软并留足左右上下活动余量，避免拖拽云台。", systemImage: "cable.connector.horizontal")
+                    Label("任何时候都可按主界面固定的 STOP 或空格键紧急停止云台。", systemImage: "stop.circle.fill")
+                    Label("目标出框后会沿离场方向寻找，并在安全范围内上下左右扫描。", systemImage: "arrow.up.left.and.arrow.down.right")
+                    Label("Apple Vision 在本机识别人像，视频画面不会上传。", systemImage: "lock.shield")
+                }
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("关键说明", systemImage: "exclamationmark.shield")
+            }
+        }
+    }
+
+    private func advancedPageHeader(
+        title: String,
+        subtitle: String,
+        symbol: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.cyan)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func guideStep(_ number: Int, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(.cyan, in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var calibrationActivityBanner: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 9) {
+                Image(
+                    systemName: calibrationNeedsAttention
+                        ? "exclamationmark.triangle.fill"
+                        : "scope"
+                )
+                .foregroundStyle(calibrationNeedsAttention ? .orange : .cyan)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(calibrationNeedsAttention ? "全向验证等待处理" : "全向验证进行中")
+                        .font(.caption.weight(.bold))
+                    Text(calibrationSummaryText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("打开详情") {
+                    openAdvancedHelp(.calibration)
+                }
+                .controlSize(.small)
+                .accessibilityIdentifier("calibrationActivityDetailsButton")
+            }
+
+            ProgressView(value: calibration.progress)
+                .tint(calibrationNeedsAttention ? .orange : .cyan)
+                .accessibilityLabel("全向安全验证进度")
+                .accessibilityValue("\(Int(calibration.progress * 100))%")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            calibrationNeedsAttention
+                ? Color.orange.opacity(0.10)
+                : Color.cyan.opacity(0.08)
+        )
+        .accessibilityIdentifier("calibrationActivityBanner")
     }
 
     private var connectionSection: some View {
@@ -507,10 +831,6 @@ private struct ControlPanel: View {
                     .disabled(!bluetooth.state.canStartScan)
                 }
             }
-
-            Text("Mac 只通过 BLE 控制 OM3；OM3 的 USB 口仅用于可选充电。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
 
             if let rememberedName = bluetooth.rememberedDeviceName {
                 Label(
@@ -561,6 +881,7 @@ private struct ControlPanel: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier("candidateDevicesDisclosure")
 
                     if showCandidateDevices {
                         VStack(spacing: 7) {
@@ -576,6 +897,12 @@ private struct ControlPanel: View {
                 .padding(10)
                 .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
             }
+        }
+        .padding(12)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 11))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11)
+                .stroke(.white.opacity(0.06))
         }
     }
 
@@ -596,6 +923,8 @@ private struct ControlPanel: View {
                 }
             }
             .toggleStyle(.switch)
+            .accessibilityIdentifier("motionSafetyToggle")
+            .accessibilityValue(motionSafetyAccessibilityValue)
             .disabled(
                 !bluetooth.state.isReady
                     || (!safetyArmed
@@ -616,15 +945,52 @@ private struct ControlPanel: View {
                         ? .green
                         : (safetyArmed ? .orange : .secondary)
                 )
+
+            Divider()
+                .opacity(0.55)
+
+            HStack(alignment: .center, spacing: 9) {
+                Image(
+                    systemName: calibration.isRunning
+                        ? "scope"
+                        : (calibration.envelopeIsActive
+                            ? "checkmark.circle.fill"
+                            : "circle.dashed")
+                )
+                .foregroundStyle(
+                    calibration.isRunning
+                        ? .cyan
+                        : (calibration.envelopeIsActive ? .green : .secondary)
+                )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(calibration.isRunning ? "全向验证进行中" : "跟踪硬边界")
+                        .font(.caption.weight(.semibold))
+                    Text(calibrationSummaryText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 6)
+
+                Button(calibration.isRunning ? "打开" : "设置…") {
+                    openAdvancedHelp(.calibration)
+                }
+                .controlSize(.small)
+                .accessibilityLabel("安全范围与全向验证")
+                .accessibilityIdentifier("calibrationEntryButton")
+            }
+
         }
         .padding(12)
         .background(
-            safetyArmed ? Color.green.opacity(0.10) : Color.orange.opacity(0.08),
+            safetyReady ? Color.green.opacity(0.10) : Color.orange.opacity(0.08),
             in: RoundedRectangle(cornerRadius: 11)
         )
         .overlay {
             RoundedRectangle(cornerRadius: 11)
-                .stroke(safetyArmed ? .green.opacity(0.28) : .orange.opacity(0.20))
+                .stroke(safetyReady ? .green.opacity(0.28) : .orange.opacity(0.20))
         }
     }
 
@@ -814,6 +1180,7 @@ private struct ControlPanel: View {
                     )
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("startCalibrationButton")
                 .disabled(!calibration.canStart)
 
                 if !calibration.canStart {
@@ -896,6 +1263,37 @@ private struct ControlPanel: View {
         String(format: "%.1f", Double(tenths) / 10.0)
     }
 
+    private var calibrationSummaryText: String {
+        if calibration.isRunning {
+            if calibration.manualRecoveryPaused {
+                return "安全暂停 · 已保留进度 · 打开后按提示人工处理"
+            }
+            if let direction = calibration.currentDirection {
+                return "正在验证\(direction.title)方向 · \(Int(calibration.progress * 100))%"
+            }
+            return "正在准备验证 · \(Int(calibration.progress * 100))%"
+        }
+        if calibration.envelopeIsActive {
+            return "当前安装的四向实测范围已启用"
+        }
+        if calibration.result != nil {
+            return "上次测量仅供查看；扩展范围已失效，需回中后重新验证"
+        }
+        return "使用保守默认范围；需要时可进行全向验证"
+    }
+
+    private var calibrationNeedsAttention: Bool {
+        calibration.manualRecoveryPaused
+            || calibration.awaitingStepDecision
+            || calibration.awaitingCenterConfirmation
+    }
+
+    private var motionSafetyAccessibilityValue: String {
+        if !safetyArmed { return "运动已锁定" }
+        if !bluetooth.trackingOriginConfirmed { return "已允许点动，跟踪原点失效" }
+        return "已允许运动，原点已确认"
+    }
+
     private var safetyStatusText: String {
         if !safetyArmed {
             return "默认锁定；断线后自动复位"
@@ -903,7 +1301,7 @@ private struct ControlPanel: View {
         if !bluetooth.trackingOriginConfirmed {
             return "点动仍可用；人物跟踪前请回正并重新确认"
         }
-        return "已解锁点动与全向安全行程验证"
+        return "原点已确认，可以开始人物跟踪"
     }
 
     private var safetyChecklistText: String {
@@ -945,6 +1343,91 @@ private struct ControlPanel: View {
         return "确认已\(direction.title)移动，继续"
     }
 
+    private func openAdvancedHelp(_ page: AdvancedHelpPage) {
+        advancedHelpPage = page
+        showAdvancedHelp = true
+    }
+
+    private func emergencyStop() {
+        if calibration.isRunning {
+            calibration.emergencyStop()
+        } else {
+            tracking.emergencyStop()
+        }
+    }
+
+}
+
+/// A non-scrolling emergency control. Keeping the high-frequency tracking
+/// observation in this leaf prevents the rest of the control column from being
+/// rebuilt on every Vision update while still keeping the status current.
+private struct PersistentStopBar: View {
+    @ObservedObject var tracking: PersonTrackingCoordinator
+    @ObservedObject var calibration: GimbalRangeCalibrationCoordinator
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "shield.lefthalf.filled")
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("全局运动保护")
+                    .font(.caption.weight(.semibold))
+                Text(statusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                emergencyStop()
+            } label: {
+                Label("STOP", systemImage: "stop.fill")
+                    .font(.callout.weight(.bold))
+                    .frame(minWidth: 92)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .keyboardShortcut(.space, modifiers: [])
+            .help("紧急停止云台（空格键）；始终可用，未连接时按下无副作用")
+            .accessibilityLabel("紧急停止云台")
+            .accessibilityHint("始终可用，按空格键也可以触发")
+            .accessibilityIdentifier("globalEmergencyStop")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .background(.bar)
+    }
+
+    private var statusText: String {
+        if calibration.isRunning {
+            if calibration.manualRecoveryPaused
+                || calibration.awaitingStepDecision
+                || calibration.awaitingCenterConfirmation {
+                return "全向验证等待处理 · 空格键立即停止"
+            }
+            return "全向验证自动进行中 · 空格键立即停止"
+        }
+        if tracking.enabled {
+            switch tracking.state {
+            case .motionPaused, .searchPaused:
+                return "人物跟踪已暂停 · 空格键仍可停止"
+            default:
+                return "人物跟踪已开启 · 空格键立即停止"
+            }
+        }
+        return "STOP 始终可用 · 空格键立即停止"
+    }
+
+    private func emergencyStop() {
+        if calibration.isRunning {
+            calibration.emergencyStop()
+        } else {
+            tracking.emergencyStop()
+        }
+    }
 }
 
 /// The whole person-tracking control block. This is the main consumer of the
@@ -972,54 +1455,25 @@ private struct TrackingSection: View {
                 }
             }
             .toggleStyle(.switch)
+            .accessibilityIdentifier("personTrackingToggle")
             .disabled(calibration.isRunning || (!tracking.enabled && !tracking.canEnable))
 
             if tracking.enabled {
                 personSelectionSection
             }
 
-            if case let .motionPaused(reason) = tracking.state {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(reason, systemImage: "exclamationmark.octagon.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("结束本次跟踪") {
-                        tracking.setEnabled(false)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    Text("结束后请人工回正，再重新打开运动安全确认。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(8)
-                .background(.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-            }
-
             if let detection = tracking.selectedPersonDetection, tracking.enabled {
-                let headAnchorY = PersonTrackingPolicy.headAnchorY(for: detection)
-                HStack(spacing: 12) {
-                    Label(
-                        "置信度 \(Int(detection.confidence * 100))%",
-                        systemImage: "person.crop.rectangle"
-                    )
-                    Text(
-                        "X误差 \(signedPercent(detection.centerX - 0.5)) · 头部锚点 Y \(normalizedPercent(headAnchorY)) · 目标 Y 32% · Pitch误差 \(signedPercent(headAnchorY - PersonTrackingPolicy.verticalHeadAnchorTarget))"
-                    )
-                    .monospacedDigit()
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                Label(
+                    "目标保持中 · 置信度 \(Int(detection.confidence * 100))%",
+                    systemImage: "person.crop.rectangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.green)
             } else {
                 Text(trackingHelpText)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-
-            Label("Apple Vision 本机处理 · 画面不上传", systemImage: "lock.shield")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -1043,6 +1497,7 @@ private struct TrackingSection: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
+                .accessibilityIdentifier("trackingSpeedPicker")
                 .disabled(tracking.enabled)
 
                 Text(
@@ -1053,29 +1508,13 @@ private struct TrackingSection: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-                if tracking.speedMode == .turbo50x {
+                if tracking.speedMode == .fast {
                     Label(
-                        "50× 是目标响应倍率；Yaw 与 Pitch 合成命令按 OM3 官方最大 120°/s 封顶（0.1 秒最多 12.0°）。硬包络、累计行程、反向 STOP 与丢帧保护仍生效。",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                } else if tracking.speedMode == .fast {
-                    Label(
-                        "连续极速约为上一版极速档的 3 倍；动作之间无额外等待，请务必先空载测试并给软线留足余量。",
+                        "连续极速会增加制动距离；请确认全行程净空和线缆余量。",
                         systemImage: "exclamationmark.triangle.fill"
                     )
                     .font(.caption2)
                     .foregroundStyle(.orange)
-                }
-
-                if tracking.enabled {
-                    Label(
-                        "人物出框后先沿真实离场方向惯性寻找，再在当前安全包络内进行左右上下四向扩张扫描。",
-                        systemImage: "arrow.up.left.and.arrow.down.right"
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
                 }
 
                 if tracking.canResumeSearch {
@@ -1188,14 +1627,6 @@ private struct TrackingSection: View {
         }
     }
 
-    private func signedPercent(_ value: Double) -> String {
-        String(format: "%+.0f%%", value * 100)
-    }
-
-    private func normalizedPercent(_ value: Double) -> String {
-        String(format: "%.0f%%", value * 100)
-    }
-
     private var personCountText: String {
         guard tracking.hasAnalyzedPeopleFrame else { return "正在分析人物…" }
         return "检测到 \(tracking.visiblePeople.count) 个可跟踪人物"
@@ -1236,6 +1667,72 @@ private struct TrackingSection: View {
             return "当前原点已因点动或 STOP 失效；请人工回正，关闭并重新打开运动安全确认。"
         }
         return "需先启动摄像头、连接 OM3 并打开运动安全确认。"
+    }
+}
+
+private struct TrackingDiagnosticsSection: View {
+    @ObservedObject var tracking: PersonTrackingCoordinator
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("人物跟踪诊断", systemImage: "viewfinder")
+                    .font(.headline)
+                Spacer()
+                Text(tracking.enabled ? "运行中" : "未运行")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tracking.enabled ? .green : .secondary)
+            }
+
+            diagnosticRow("状态", tracking.state.title)
+            diagnosticRow("速度", tracking.speedMode.title)
+            diagnosticRow(
+                "候选人物",
+                tracking.hasAnalyzedPeopleFrame
+                    ? "\(tracking.visiblePeople.count) 人"
+                    : "尚未分析"
+            )
+            diagnosticRow("锁定目标", tracking.selectedPersonID?.title ?? "无")
+
+            if let detection = tracking.selectedPersonDetection {
+                let headAnchorY = PersonTrackingPolicy.headAnchorY(for: detection)
+                Divider()
+                diagnosticRow("置信度", "\(Int(detection.confidence * 100))%")
+                diagnosticRow("水平误差", signedPercent(detection.centerX - 0.5))
+                diagnosticRow("头部锚点 Y", normalizedPercent(headAnchorY))
+                diagnosticRow(
+                    "Pitch 误差",
+                    signedPercent(headAnchorY - PersonTrackingPolicy.verticalHeadAnchorTarget)
+                )
+            }
+        }
+        .padding(12)
+        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 11))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11)
+                .stroke(.white.opacity(0.06))
+        }
+    }
+
+    private func diagnosticRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 82, alignment: .leading)
+            Text(value)
+                .font(.caption.monospacedDigit())
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func signedPercent(_ value: Double) -> String {
+        String(format: "%+.0f%%", value * 100)
+    }
+
+    private func normalizedPercent(_ value: Double) -> String {
+        String(format: "%.0f%%", value * 100)
     }
 }
 
@@ -1292,24 +1789,15 @@ private struct MotionSection: View {
                         nudge(yaw: -5, pitch: 0, label: "左转 -5°")
                     }
 
-                    Button {
-                        emergencyStop()
-                    } label: {
-                        VStack(spacing: 2) {
-                            Image(systemName: "stop.fill")
-                            Text("STOP").font(.caption.weight(.bold))
-                            Text("空格").font(.caption2)
-                                .foregroundStyle(.white.opacity(0.75))
-                        }
-                        .frame(width: 88, height: 58)
+                    VStack(spacing: 3) {
+                        Image(systemName: "dot.circle")
+                        Text("每步 5°")
+                            .font(.caption.weight(.medium))
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.red)
-                    // Deliberately never disabled: the emergency path must stay
-                    // reachable during connecting/reconnecting states, when a
-                    // previously commanded motion could still be running.
-                    .keyboardShortcut(.space, modifiers: [])
-                    .help("紧急停止（空格键）；未连接时按下无副作用")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 88, height: 58)
+                    .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+                    .accessibilityHidden(true)
 
                     NudgeButton(title: "右转", symbol: "arrow.right", enabled: canMove) {
                         nudge(yaw: 5, pitch: 0, label: "右转 +5°")
@@ -1328,13 +1816,6 @@ private struct MotionSection: View {
         bluetooth.sendNudge(yawDegrees: yaw, pitchDegrees: pitch, label: label)
     }
 
-    private func emergencyStop() {
-        if calibration.isRunning {
-            calibration.emergencyStop()
-        } else {
-            tracking.emergencyStop()
-        }
-    }
 }
 
 private struct DeviceRow: View {
@@ -1387,23 +1868,6 @@ private struct NudgeButton: View {
         }
         .buttonStyle(.bordered)
         .disabled(!enabled)
-    }
-}
-
-private struct WiringStrip: View {
-    var body: some View {
-        HStack(spacing: 10) {
-            Label("Mac mini", systemImage: "macmini")
-            Image(systemName: "arrow.right")
-                .foregroundStyle(.secondary)
-            Label("摄像头", systemImage: "video.fill")
-            Spacer()
-            Text("OM3 USB → 充电器（可选）")
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(10)
-        .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
     }
 }
 

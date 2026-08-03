@@ -71,7 +71,7 @@ final class PersonTrackingCoordinator: ObservableObject {
 
     @Published private(set) var enabled = false
     @Published private(set) var canEnable = false
-    @Published private(set) var speedMode: PersonTrackingSpeedMode = .turbo50x
+    @Published private(set) var speedMode: PersonTrackingSpeedMode = .fast
 
     // These change on the ~12.5 Hz vision cadence, and @Published fires
     // objectWillChange on every assignment even when the value is identical.

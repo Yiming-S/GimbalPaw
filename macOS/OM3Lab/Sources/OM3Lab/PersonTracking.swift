@@ -892,10 +892,6 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
     case smooth = 0
     case standard = 1
     case fast = 2
-    /// Fifty times the nominal angular-rate profile of the smooth mode at the
-    /// same proportional-curve waypoints, capped by DJI's published OM3
-    /// maximum rotation speed. Software safety envelopes still clamp every move.
-    case turbo50x = 3
 
     var id: Int { rawValue }
 
@@ -904,18 +900,11 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return "平稳"
         case .standard: return "标准"
         case .fast: return "连续极速"
-        case .turbo50x: return "追踪 50×"
         }
     }
 
     var detail: String {
-        if self == .turbo50x {
-            return "相对平稳档目标 50× · OM3 官方 120°/s 封顶 · 无额外等待"
-        }
-        if self == .fast {
-            return "最大 \(formatTenths(combinedMaximumTenths))° / \(formatTenths(Int(commandDurationTenths))) 秒 · 应用无额外等待"
-        }
-        return "最大 \(formatTenths(combinedMaximumTenths))° / \(formatTenths(Int(commandDurationTenths))) 秒 · 间隔 \(String(format: "%.2f", commandCooldown)) 秒"
+        "最大 \(formatTenths(combinedMaximumTenths))° / \(formatTenths(Int(commandDurationTenths))) 秒 · 连续动作 · 无额外等待"
     }
 
     var yawMaximumTenths: Int {
@@ -923,10 +912,6 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 15
         case .standard: return 20
         case .fast: return 65
-        case .turbo50x:
-            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
-                durationTenths: commandDurationTenths
-            )
         }
     }
 
@@ -935,7 +920,6 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 10
         case .standard: return 15
         case .fast: return 20
-        case .turbo50x: return 91
         }
     }
 
@@ -946,7 +930,6 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth, .standard: return 3
         case .fast: return 5
-        case .turbo50x: return 28
         }
     }
 
@@ -954,7 +937,6 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         switch self {
         case .smooth, .standard: return 10
         case .fast: return 35
-        case .turbo50x: return 91
         }
     }
 
@@ -963,63 +945,37 @@ enum PersonTrackingSpeedMode: Int, CaseIterable, Identifiable, Sendable {
         case .smooth: return 15
         case .standard: return 20
         case .fast: return 65
-        case .turbo50x:
-            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
-                durationTenths: commandDurationTenths
-            )
         }
     }
 
     var commandDurationTenths: UInt8 {
-        switch self {
-        case .smooth, .standard: return 3
-        case .fast, .turbo50x: return 1
-        }
+        1
     }
 
+    /// The transport unlocks exactly when the declared relative move ends.
+    /// Therefore every speed mode is continuous; slower modes differ only in
+    /// requested angular rate and never add an application-side idle gap.
     var commandCooldown: TimeInterval {
-        switch self {
-        case .smooth: return 0.55
-        case .standard: return 0.45
-        case .fast, .turbo50x: return 0.10
-        }
+        Double(commandDurationTenths) / 10.0
     }
 
     var maximumSampleAge: TimeInterval {
-        switch self {
-        case .smooth, .standard: return 0.25
-        case .fast, .turbo50x: return 0.10
-        }
+        0.10
     }
 
-    /// Growth remains smoothed in the legacy profiles. The 50x profile scales
-    /// the full response, so an existing small same-direction command cannot
-    /// silently hold it at legacy acceleration for another 0.7 seconds.
     var correctionGrowthLimitTenths: Int {
-        switch self {
-        case .smooth, .standard, .fast: return PersonTrackingPolicy.slewLimitTenths
-        case .turbo50x:
-            return OM3HardwareMotionLimits.maximumCombinedCommandTenths(
-                durationTenths: commandDurationTenths
-            )
-        }
+        PersonTrackingPolicy.slewLimitTenths
     }
 
     /// Cumulative fuses catch prolonged oscillation and cable fatigue without
     /// undercutting the expanded net pose envelope. They do not enlarge the
     /// pose boundary: every command is still clipped to the calibrated diamond.
     var yawTravelBudgetTenths: Int {
-        switch self {
-        case .smooth, .standard, .fast: return 12_000
-        case .turbo50x: return 45_000
-        }
+        12_000
     }
 
     var pitchTravelBudgetTenths: Int {
-        switch self {
-        case .smooth, .standard, .fast: return 12_000
-        case .turbo50x: return 45_000
-        }
+        12_000
     }
 
     private func formatTenths(_ value: Int) -> String {
@@ -1033,27 +989,29 @@ struct PersonTrackingSpeedSelection: Equatable, Sendable {
 }
 
 enum PersonTrackingSpeedSelectionPolicy {
-    static let currentProfileVersion = 1
+    static let currentProfileVersion = 2
+    /// Raw value used by the removed fourth speed mode in profile version 1.
+    static let retiredSpeedModeRawValue = 3
 
-    /// Upgrade every pre-50x installation once, then preserve subsequent user
-    /// choices exactly. Invalid or missing values fail toward the requested
-    /// 50x profile and are normalized back to UserDefaults.
+    /// Preserve every still-valid user choice. Installations that last used the
+    /// retired fourth mode move to continuous-fast, while missing or corrupted
+    /// preferences also fail toward the fastest remaining verified profile.
     static func selection(
         storedRawValue: Int?,
         storedProfileVersion: Int?
     ) -> PersonTrackingSpeedSelection {
-        guard (storedProfileVersion ?? 0) >= currentProfileVersion,
-              let storedRawValue,
+        guard let storedRawValue,
+              storedRawValue != retiredSpeedModeRawValue,
               let storedMode = PersonTrackingSpeedMode(rawValue: storedRawValue)
         else {
             return PersonTrackingSpeedSelection(
-                mode: .turbo50x,
+                mode: .fast,
                 requiresWriteback: true
             )
         }
         return PersonTrackingSpeedSelection(
             mode: storedMode,
-            requiresWriteback: false
+            requiresWriteback: (storedProfileVersion ?? 0) < currentProfileVersion
         )
     }
 }

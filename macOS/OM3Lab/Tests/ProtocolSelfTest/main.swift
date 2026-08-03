@@ -200,10 +200,6 @@ do {
         PersonTrackingPolicy.correction(for: farLeft, speedMode: .fast)?.yawTenths == -65,
         "continuous fast tracking profile must cap yaw at 6.5 degrees"
     )
-    expect(
-        PersonTrackingPolicy.correction(for: farLeft, speedMode: .turbo50x)?.yawTenths == -120,
-        "50x tracking profile must respect the OM3 12-degree-per-0.1-second cap"
-    )
     let fastNearRight = PersonDetection(
         x: 0.55,
         y: 0.3,
@@ -227,12 +223,14 @@ do {
         "continuous fast tracking must interpolate the medium band"
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastNearRight, speedMode: .turbo50x)?.yawTenths == 47,
-        "50x tracking must scale the near-error proportional waypoint"
+        PersonTrackingSpeedMode.allCases == [.smooth, .standard, .fast],
+        "the speed picker must expose exactly three profiles"
     )
     expect(
-        PersonTrackingPolicy.correction(for: fastMidRight, speedMode: .turbo50x)?.yawTenths == 106,
-        "50x tracking must scale the medium-error waypoint below the hardware cap"
+        PersonTrackingSpeedMode(
+            rawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue
+        ) == nil,
+        "the retired fourth profile must not remain as a hidden enum case"
     )
     let previousContinuousMaximumRate = 45.0 / 0.21
     let upgradedMaximumRate = Double(PersonTrackingSpeedMode.fast.yawMaximumTenths)
@@ -245,93 +243,65 @@ do {
         PersonTrackingSpeedMode.fast.pitchMaximumTenths <= 20,
         "fast tracking pitch must stay capped at two degrees"
     )
+    let yawRates = PersonTrackingSpeedMode.allCases.map {
+        Double($0.yawMaximumTenths) / $0.commandCooldown
+    }
+    let pitchRates = PersonTrackingSpeedMode.allCases.map {
+        Double($0.pitchMaximumTenths) / $0.commandCooldown
+    }
+    for mode in PersonTrackingSpeedMode.allCases {
+        expect(
+            mode.commandDurationTenths == 1,
+            "every speed profile must use the verified 0.1-second action cadence"
+        )
+        expect(
+            mode.commandCooldown == Double(mode.commandDurationTenths) / 10.0,
+            "every speed profile must unlock exactly when its action ends"
+        )
+        expect(
+            mode.maximumSampleAge == 0.10,
+            "every speed profile must reject samples older than 0.1 seconds"
+        )
+        let requestedRate = Double(mode.combinedMaximumTenths) / mode.commandCooldown
+        expect(
+            requestedRate
+                <= Double(OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond),
+            "every speed profile must remain below the OM3 speed ceiling"
+        )
+    }
     expect(
-        PersonTrackingSpeedMode.fast.commandCooldown
-            == Double(PersonTrackingSpeedMode.fast.commandDurationTenths) / 10.0,
-        "continuous fast tracking must add no idle delay after each action"
+        yawRates[0] < yawRates[1] && yawRates[1] < yawRates[2],
+        "smooth, standard, and fast yaw rates must be strictly increasing"
     )
     expect(
-        PersonTrackingSpeedMode.fast.maximumSampleAge
-            <= PersonTrackingSpeedMode.fast.commandCooldown,
-        "fast tracking must reject samples older than one command interval"
+        pitchRates[0] < pitchRates[1] && pitchRates[1] < pitchRates[2],
+        "smooth, standard, and fast pitch rates must be strictly increasing"
     )
-    let smoothYawRate = Double(PersonTrackingSpeedMode.smooth.yawMaximumTenths)
-        / PersonTrackingSpeedMode.smooth.commandCooldown
-    let turboYawRate = Double(PersonTrackingSpeedMode.turbo50x.yawMaximumTenths)
-        / PersonTrackingSpeedMode.turbo50x.commandCooldown
-    let smoothPitchRate = Double(PersonTrackingSpeedMode.smooth.pitchMaximumTenths)
-        / PersonTrackingSpeedMode.smooth.commandCooldown
-    let turboPitchRate = Double(PersonTrackingSpeedMode.turbo50x.pitchMaximumTenths)
-        / PersonTrackingSpeedMode.turbo50x.commandCooldown
-    expect(
-        turboYawRate
-            == Double(OM3HardwareMotionLimits.maximumControllableSpeedTenthsPerSecond),
-        "50x yaw must saturate exactly at DJI's published OM3 speed ceiling"
-    )
-    expect(
-        turboYawRate / smoothYawRate > 40.0
-            && turboYawRate / smoothYawRate <= 50.0,
-        "the hardware-capped 50x yaw response must remain above forty times smooth mode"
-    )
-    expect(
-        abs(turboPitchRate / smoothPitchRate - 50.0) <= 0.5,
-        "50x tracking pitch rate must remain approximately fifty times smooth mode"
-    )
-    expect(
-        abs(
-            Double(PersonTrackingSpeedMode.turbo50x.minimumStepTenths)
-                / PersonTrackingSpeedMode.turbo50x.commandCooldown
-                / (Double(PersonTrackingSpeedMode.smooth.minimumStepTenths)
-                    / PersonTrackingSpeedMode.smooth.commandCooldown)
-                - 50.0
-        ) <= 1.5,
-        "50x tracking minimum correction rate must remain near the profile ratio"
-    )
-    expect(
-        abs(
-            Double(PersonTrackingSpeedMode.turbo50x.mediumStepTenths)
-                / PersonTrackingSpeedMode.turbo50x.commandCooldown
-                / (Double(PersonTrackingSpeedMode.smooth.mediumStepTenths)
-                    / PersonTrackingSpeedMode.smooth.commandCooldown)
-                - 50.0
-        ) <= 0.5,
-        "50x tracking medium correction rate must remain near the profile ratio"
-    )
-    expect(
-        PersonTrackingSpeedMode.turbo50x.commandCooldown
-            == Double(PersonTrackingSpeedMode.turbo50x.commandDurationTenths) / 10.0,
-        "50x tracking must add no idle delay after each action"
-    )
-    expect(
-        PersonTrackingSpeedMode.turbo50x.maximumSampleAge
-            <= PersonTrackingSpeedMode.turbo50x.commandCooldown,
-        "50x tracking must reject samples older than one command interval"
-    )
-    let turboGrowth = PersonTrackingPolicy.predictiveCorrection(
+    let fastGrowth = PersonTrackingPolicy.predictiveCorrection(
         anchorX: 0.95,
         anchorY: 0.32,
         velocityX: 0,
         velocityY: 0,
         centering: .uncentered,
         previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
-        speedMode: .turbo50x
+        speedMode: .fast
     )
     expect(
-        turboGrowth.correction?.yawTenths == 120,
-        "50x tracking must remove the legacy growth bottleneck without exceeding 120°/s"
+        fastGrowth.correction?.yawTenths == 48,
+        "continuous fast tracking must retain bounded same-direction growth"
     )
-    let turboReverse = PersonTrackingPolicy.predictiveCorrection(
+    let fastReverse = PersonTrackingPolicy.predictiveCorrection(
         anchorX: 0.05,
         anchorY: 0.32,
         velocityX: 0,
         velocityY: 0,
         centering: .uncentered,
         previousCorrection: PersonTrackingCorrection(yawTenths: 28, pitchTenths: 0),
-        speedMode: .turbo50x
+        speedMode: .fast
     )
     expect(
-        turboReverse.requiresReversalStop && turboReverse.correction == nil,
-        "50x tracking must retain the major-reversal STOP"
+        fastReverse.requiresReversalStop && fastReverse.correction == nil,
+        "continuous fast tracking must retain the major-reversal STOP"
     )
     expect(
         PersonTrackingSpeedMode.smooth.yawTravelBudgetTenths
@@ -345,41 +315,62 @@ do {
     )
     expect(
         PersonTrackingTravelBudgetPolicy.allowsCorrection(
-            nextYawTravelTenths: 45_000,
-            nextPitchTravelTenths: 45_000,
-            speedMode: .turbo50x
+            nextYawTravelTenths: 12_000,
+            nextPitchTravelTenths: 12_000,
+            speedMode: .fast
         ),
-        "50x correction budget must accept its exact limits"
+        "continuous correction budget must accept its exact limits"
     )
     expect(
         !PersonTrackingTravelBudgetPolicy.allowsCorrection(
-            nextYawTravelTenths: 45_001,
-            nextPitchTravelTenths: 45_000,
-            speedMode: .turbo50x
+            nextYawTravelTenths: 12_001,
+            nextPitchTravelTenths: 12_000,
+            speedMode: .fast
         ),
-        "50x correction budget must reject travel above its yaw limit"
+        "continuous correction budget must reject travel above its yaw limit"
     )
     expect(
         !PersonTrackingTravelBudgetPolicy.allowsSearch(
-            nextYawTravelTenths: 45_001,
+            nextYawTravelTenths: 12_001,
             nextPitchTravelTenths: 0,
-            speedMode: .turbo50x
+            speedMode: .fast
         ),
-        "50x search budget must share the same yaw limit"
+        "continuous search budget must share the same yaw limit"
     )
     expect(
         PersonTrackingSpeedSelectionPolicy.selection(
-            storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
-            storedProfileVersion: nil
-        ) == PersonTrackingSpeedSelection(mode: .turbo50x, requiresWriteback: true),
-        "pre-50x installs must migrate once"
+            storedRawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue,
+            storedProfileVersion: 1
+        ) == PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true),
+        "the retired fourth profile must migrate to continuous fast"
+    )
+    expect(
+        PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: PersonTrackingSpeedSelectionPolicy.retiredSpeedModeRawValue,
+            storedProfileVersion: PersonTrackingSpeedSelectionPolicy.currentProfileVersion
+        ) == PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true),
+        "the retired fourth profile must migrate even if its version marker is current"
     )
     expect(
         PersonTrackingSpeedSelectionPolicy.selection(
             storedRawValue: PersonTrackingSpeedMode.smooth.rawValue,
             storedProfileVersion: 1
-        ) == PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: false),
-        "a post-migration manual smooth choice must persist"
+        ) == PersonTrackingSpeedSelection(mode: .smooth, requiresWriteback: true),
+        "a valid smooth choice must persist while upgrading the profile version"
+    )
+    expect(
+        PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: PersonTrackingSpeedMode.standard.rawValue,
+            storedProfileVersion: PersonTrackingSpeedSelectionPolicy.currentProfileVersion
+        ) == PersonTrackingSpeedSelection(mode: .standard, requiresWriteback: false),
+        "a current standard choice must persist without a redundant write"
+    )
+    expect(
+        PersonTrackingSpeedSelectionPolicy.selection(
+            storedRawValue: nil,
+            storedProfileVersion: nil
+        ) == PersonTrackingSpeedSelection(mode: .fast, requiresWriteback: true),
+        "a missing speed preference must fall back to continuous fast"
     )
     expect(
         PersonTrackingPolicy.minimumStopCooldown >= 0.12,

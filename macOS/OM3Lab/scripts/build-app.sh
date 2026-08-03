@@ -71,8 +71,14 @@ mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
 install -m 755 "$build_dir/OM3Lab" "$staged_app/Contents/MacOS/OM3Lab"
 install -m 644 "$project_dir/Resources/Info.plist" "$staged_app/Contents/Info.plist"
 install -m 644 "$project_dir/Resources/PkgInfo" "$staged_app/Contents/PkgInfo"
+install -m 644 "$project_dir/Resources/AppIcon.icns" "$staged_app/Contents/Resources/AppIcon.icns"
 
 plutil -lint "$staged_app/Contents/Info.plist"
+if [[ "$(plutil -extract CFBundleIconFile raw "$staged_app/Contents/Info.plist")" != "AppIcon.icns" ]]; then
+    echo "App 图标配置验证失败" >&2
+    exit 1
+fi
+test -f "$staged_app/Contents/Resources/AppIcon.icns"
 
 codesign \
     --force \
